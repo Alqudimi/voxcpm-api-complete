@@ -52,6 +52,17 @@ Multipart:
 - `retry_ratio_threshold`
 - `auto_transcribe`
 
+### Voice Cloning & Audio Mixing (Clone and Mix)
+`POST /api/v1/voice/clone-and-mix` (انظر التوثيق الكامل في [CLONE_AND_MIX_API.md](CLONE_AND_MIX_API.md))
+
+Multipart:
+- نفس معاملات `clone` بالإضافة إلى:
+  - `noise_audio` (ملف صوت الضوضاء)
+  - `source_gain_db`
+  - `noise_gain_db`
+  - `variation_seed`
+  - `output_format`
+
 ### Transcription
 `POST /api/v1/audio/transcribe`
 
