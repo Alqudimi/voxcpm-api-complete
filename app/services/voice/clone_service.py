@@ -86,7 +86,7 @@ class VoiceCloneService:
 
         target_text = normalize_iraqi_target(target_text)
         base_seed = int(options.get("seed") if options.get("seed") is not None else 12345)
-        count = int(options.get("candidates", settings.DEFAULT_CANDIDATES))
+        count = 1
 
         ranked = []
         model_sr = int(getattr(model_manager.voxcpm.tts_model, "sample_rate", settings.OUTPUT_SAMPLE_RATE))
