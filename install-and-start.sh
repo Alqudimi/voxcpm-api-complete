@@ -1,221 +1,263 @@
 #!/usr/bin/env bash
-set -e
+set -Eeuo pipefail
 
 # ============================================================
 # VoxCPM API - RunPod Setup & Startup
+# This keeps the original installation flow and adds robust
+# workspace selection, FFmpeg, and Audio Mixer dependencies.
 # ============================================================
 
-PROJECT="/workspace/voxcpm-api-complete2"
-REPO="https://github.com/Alqudimi/voxcpm-api-complete.git"
+REPO="${REPO_URL:-https://github.com/Alqudimi/voxcpm-api-complete.git}"
+PROJECT_NAME="voxcpm-api-complete"
 
-PYTHON_BIN="$PROJECT/.venv/bin/python"
-
-echo ""
-echo "============================================================"
-echo "04 VoxCPM API - RunPod Setup"
-echo "============================================================"
-echo ""
-
-# ============================================================
-# 1. Clone Project
-# ============================================================
-
-if [ ! -d "$PROJECT/.git" ]; then
-
-    echo "9à3 Cloning repository..."
-
-    cd /workspace
-    git clone "$REPO"
-    
-
+# RunPod normally provides /workspace. If it is absent or not writable,
+# use a directory under HOME instead. Override with WORKSPACE_DIR or
+# PROJECT_DIR if your environment uses another location.
+if [[ -n "${WORKSPACE_DIR:-}" ]]; then
+    BASE_DIR="$WORKSPACE_DIR"
+elif [[ -n "${RUNPOD_WORKSPACE:-}" ]]; then
+    BASE_DIR="$RUNPOD_WORKSPACE"
+elif [[ -d /workspace && -w /workspace ]]; then
+    BASE_DIR="/workspace"
+elif mkdir -p /workspace 2>/dev/null && [[ -w /workspace ]]; then
+    BASE_DIR="/workspace"
 else
+    BASE_DIR="${HOME:-/tmp}/workspace"
+fi
+mkdir -p "$BASE_DIR"
 
-    echo "9à4 Project already exists"
+PROJECT="${PROJECT_DIR:-$BASE_DIR/$PROJECT_NAME}"
+if [[ "$PROJECT" != /* ]]; then
+    PROJECT="$PWD/$PROJECT"
+fi
+mkdir -p "$(dirname "$PROJECT" )"
+
+CACHE_DIR="${CACHE_DIR:-$BASE_DIR/.cache}"
+if [[ "$CACHE_DIR" != /* ]]; then
+    CACHE_DIR="$PWD/$CACHE_DIR"
+fi
+
+PYTHON_SYSTEM="${PYTHON_SYSTEM:-python3}"
+
+printf '\n%s\n' '============================================================'
+printf '%s\n' 'VoxCPM API - RunPod Setup'
+printf '%s\n\n' '============================================================'
+printf 'Workspace: %s\nProject:   %s\nRepository: %s\n\n' "$BASE_DIR" "$PROJECT" "$REPO"
+
+# ============================================================
+# 1. Check prerequisites and Python version before large installs
+# ============================================================
+
+if ! command -v "$PYTHON_SYSTEM" >/dev/null 2>&1; then
+    echo "ERROR: Python executable not found: $PYTHON_SYSTEM" >&2
+    exit 1
+fi
+
+if ! "$PYTHON_SYSTEM" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
+    echo "ERROR: Python 3.11 or newer is required. Found: $("$PYTHON_SYSTEM" --version 2>&1)" >&2
+    echo "Set PYTHON_SYSTEM to an installed Python 3.11+ executable and retry." >&2
+    exit 1
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+    echo "ERROR: git is required to clone the project." >&2
+    exit 1
+fi
+
+# ============================================================
+# 2. Clone or update project
+# ============================================================
+
+if [[ -d "$PROJECT/.git" ]]; then
+    echo "Project already exists; trying a fast-forward update..."
     cd "$PROJECT"
-
-    git pull --ff-only || true
-
+    if ! git pull --ff-only; then
+        echo "WARNING: git pull failed; continuing with the existing checkout." >&2
+    fi
+else
+    if [[ -e "$PROJECT" ]]; then
+        if [[ -n "$(find "$PROJECT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+            echo "ERROR: $PROJECT exists but is not a Git checkout and is not empty." >&2
+            echo "Set PROJECT_DIR to another location or move that directory first." >&2
+            exit 1
+        fi
+        rmdir "$PROJECT"
+    fi
+    echo "Cloning repository into the exact project path..."
+    git clone "$REPO" "$PROJECT"
 fi
 
 cd "$PROJECT"
 
-# ============================================================
-# 2. Create Virtual Environment
-# ============================================================
-
-if [ ! -d "$PROJECT/.venv" ]; then
-
-    echo "9Ê7 Creating Python virtual environment..."
-
-    python3 -m venv .venv
-
-else
-
-    echo "7½7 Virtual environment already exists"
-
-fi
-
-# ============================================================
-# 3. Activate Virtual Environment
-# ============================================================
-
-source "$PROJECT/.venv/bin/activate"
-
-echo ""
-echo "Python:"
-python --version
-
-# ============================================================
-# 4. Upgrade pip
-# ============================================================
-
-echo ""
-echo "8¤815 Upgrading pip..."
-
-python -m pip install --upgrade pip setuptools wheel
-
-# ============================================================
-# 5. Install PyTorch CUDA 12.8
-# ============================================================
-
-echo ""
-echo "9æ7 Installing PyTorch CUDA 12.8..."
-
-python -m pip install \
-    torch==2.8.0 \
-    torchvision==0.23.0 \
-    torchaudio==2.8.0 \
-    --index-url https://download.pytorch.org/whl/cu128
-
-# ============================================================
-# 6. Remove torch from requirements.txt
-# ============================================================
-
-if [ -f "$PROJECT/requirements.txt" ]; then
-
-    echo ""
-    echo "0ä3 Removing torch from requirements.txt..."
-
-    sed -i '/^[[:space:]]*torch[[:space:]]*$/d' \
-        "$PROJECT/requirements.txt"
-
-fi
-
-# ============================================================
-# 7. Install Requirements
-# ============================================================
-
-if [ -f "$PROJECT/requirements.txt" ]; then
-
-    echo ""
-    echo "9à4 Installing project requirements..."
-
-    python -m pip install -r "$PROJECT/requirements.txt"
-
-fi
-
-# ============================================================
-# 7A. Install Audio Mixer runtime requirements
-# ============================================================
-
-echo ""
-echo "9¿215 Installing Audio Mixer runtime requirements..."
-
-if ! "$PYTHON_BIN" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 11) else 1)'; then
-    echo "❌ The combined project requires Python 3.11 or newer. Current interpreter: $($PYTHON_BIN --version 2>&1)" >&2
+if [[ ! -f "$PROJECT/requirements.txt" ]]; then
+    echo "ERROR: requirements.txt was not found in $PROJECT" >&2
     exit 1
 fi
 
+if [[ ! -f "$PROJECT/app/audio_mixer/api.py" ]] || ! grep -q 'include_audio_mixer' "$PROJECT/app/main.py"; then
+    echo "ERROR: Audio Mixer source or its FastAPI registration is missing from this checkout." >&2
+    echo "Use the Alqudimi/voxcpm-api-complete repository that contains app/audio_mixer." >&2
+    exit 1
+fi
+
+# ============================================================
+# 3. Create and activate virtual environment
+# ============================================================
+
+if [[ ! -x "$PROJECT/.venv/bin/python" ]]; then
+    echo "Creating Python virtual environment..."
+    "$PYTHON_SYSTEM" -m venv "$PROJECT/.venv"
+else
+    echo "Using existing virtual environment: $PROJECT/.venv"
+fi
+
+PYTHON_BIN="$PROJECT/.venv/bin/python"
+source "$PROJECT/.venv/bin/activate"
+python --version
+
+# ============================================================
+# 4. Upgrade packaging tools
+# ============================================================
+
+echo "Upgrading pip, setuptools and wheel..."
+"$PYTHON_BIN" -m pip install --upgrade pip setuptools wheel
+
+# ============================================================
+# 5. Install PyTorch (CUDA 12.8 by default; CPU optional)
+# Run with INSTALL_CPU_ONLY=1 to use CPU wheels instead.
+# ============================================================
+
+if [[ "${INSTALL_CPU_ONLY:-0}" == "1" ]]; then
+    echo "Installing CPU-only PyTorch 2.8.0..."
+    TORCH_INDEX_URL="https://download.pytorch.org/whl/cpu"
+else
+    echo "Installing PyTorch 2.8.0 with CUDA 12.8 support..."
+    TORCH_INDEX_URL="https://download.pytorch.org/whl/cu128"
+fi
+
+"$PYTHON_BIN" -m pip install \
+    torch==2.8.0 \
+    torchvision==0.23.0 \
+    torchaudio==2.8.0 \
+    --index-url "$TORCH_INDEX_URL"
+
+# ============================================================
+# 6. Install project requirements without editing requirements.txt
+# The pinned PyTorch above is excluded only from a temporary copy.
+# ============================================================
+
+FILTERED_REQUIREMENTS="$(mktemp "$PROJECT/.requirements-runpod.XXXXXX" )"
+sed -E '/^[[:space:]]*torch([[:space:]]|[<=>!~]|$)/d' \
+    "$PROJECT/requirements.txt" > "$FILTERED_REQUIREMENTS"
+
+if "$PYTHON_BIN" -m pip install -r "$FILTERED_REQUIREMENTS"; then
+    rm -f "$FILTERED_REQUIREMENTS"
+else
+    rm -f "$FILTERED_REQUIREMENTS"
+    echo "ERROR: Installing requirements.txt failed." >&2
+    exit 1
+fi
+
+# ============================================================
+# 7. Install FFmpeg and Audio Mixer runtime requirements
+# ============================================================
+
 if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+    echo "FFmpeg/ffprobe are missing; installing the ffmpeg system package..."
+
     if ! command -v apt-get >/dev/null 2>&1; then
-        echo "7Ã4 ffmpeg/ffprobe are missing and apt-get is unavailable." >&2
+        echo "ERROR: apt-get is unavailable. Install ffmpeg and ffprobe manually." >&2
         exit 1
     fi
 
-    if [ "$(id -u)" -eq 0 ]; then
+    if [[ "$(id -u)" -eq 0 ]]; then
         apt-get update
         DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg
     elif command -v sudo >/dev/null 2>&1; then
         sudo apt-get update
         sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y ffmpeg
     else
-        echo "7Ã4 Install FFmpeg as root (or provide sudo) before continuing." >&2
+        echo "ERROR: Installing FFmpeg requires root or sudo privileges." >&2
         exit 1
     fi
 fi
 
+if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+    echo "ERROR: ffmpeg/ffprobe are still unavailable after installation." >&2
+    exit 1
+fi
+
+echo "FFmpeg: $(ffmpeg -version | head -n 1)"
+echo "ffprobe: $(ffprobe -version | head -n 1)"
+
+FFMPEG_ENCODERS="$(ffmpeg -hide_banner -encoders 2>/dev/null)"
+if ! grep -q 'libopus' <<<"$FFMPEG_ENCODERS"; then
+    echo "ERROR: This FFmpeg build has no libopus encoder, required for OGG/Opus output." >&2
+    exit 1
+fi
+echo "FFmpeg libopus encoder: OK"
+
+# Audio Mixer runtime dependencies. The full VoxCPM requirements are installed above.
 "$PYTHON_BIN" -m pip install \
-    'fastapi>=0.110' \
-    'uvicorn>=0.29' \
-    'python-multipart>=0.0.9' \
+    'fastapi>=0.115' \
+    'uvicorn[standard]>=0.34' \
+    'python-multipart>=0.0.20' \
+    'pydantic>=2.10' \
+    'pydantic-settings>=2.7' \
+    'numpy>=1.26' \
+    'scipy' \
+    'soundfile' \
+    'librosa' \
     'psycopg[binary]>=3.2'
 
 "$PYTHON_BIN" -m pip check
 
-echo "7½7 Audio Mixer runtime requirements installed"
-
 # ============================================================
-# 8. HuggingFace / Whisper Cache
+# 8. Hugging Face / Whisper cache directories and environment
 # ============================================================
 
-echo ""
-echo "9Ü7 Creating cache directories..."
+HF_HOME="${HF_HOME:-$CACHE_DIR/huggingface}"
+HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
+XDG_CACHE_HOME="${XDG_CACHE_HOME:-$CACHE_DIR}"
 
-mkdir -p \
-    /workspace/.cache/huggingface \
-    /workspace/.cache/huggingface/hub \
-    /workspace/.cache/whisper
+mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$XDG_CACHE_HOME/whisper"
+export HF_HOME HUGGINGFACE_HUB_CACHE XDG_CACHE_HOME
 
-# ============================================================
-# 9. Environment Variables
-# ============================================================
-
-export HF_HOME="/workspace/.cache/huggingface"
-export HUGGINGFACE_HUB_CACHE="/workspace/.cache/huggingface/hub"
-export XDG_CACHE_HOME="/workspace/.cache"
+echo "Model cache: $HF_HOME"
+echo "Whisper cache: $XDG_CACHE_HOME/whisper"
 
 # ============================================================
-# 10. Save Environment Variables
+# 9. Persist cache environment variables in the user's bashrc
+# The generated startup.sh also exports them when launched directly.
 # ============================================================
 
-echo ""
-echo "7±515 Configuring environment variables..."
+BASHRC="${HOME:-/tmp}/.bashrc"
+if touch "$BASHRC" 2>/dev/null; then
+    add_bashrc_export() {
+        local name="$1"
+        local value="$2"
+        local escaped
+        printf -v escaped '%q' "$value"
+        local line="export $name=$escaped"
 
-touch /workspace/.bashrc
+        if ! grep -qxF "$line" "$BASHRC"; then
+            printf '%s\n' "$line" >> "$BASHRC"
+        fi
+    }
 
-grep -qxF \
-    'export HF_HOME="/workspace/.cache/huggingface"' \
-    /workspace/.bashrc \
-    || echo 'export HF_HOME="/workspace/.cache/huggingface"' \
-    >> /workspace/.bashrc
-
-grep -qxF \
-    'export HUGGINGFACE_HUB_CACHE="/workspace/.cache/huggingface/hub"' \
-    /workspace/.bashrc \
-    || echo 'export HUGGINGFACE_HUB_CACHE="/workspace/.cache/huggingface/hub"' \
-    >> /workspace/.bashrc
-
-grep -qxF \
-    'export XDG_CACHE_HOME="/workspace/.cache"' \
-    /workspace/.bashrc \
-    || echo 'export XDG_CACHE_HOME="/workspace/.cache"' \
-    >> /workspace/.bashrc
+    add_bashrc_export HF_HOME "$HF_HOME"
+    add_bashrc_export HUGGINGFACE_HUB_CACHE "$HUGGINGFACE_HUB_CACHE"
+    add_bashrc_export XDG_CACHE_HOME "$XDG_CACHE_HOME"
+else
+    echo "WARNING: Could not update $BASHRC; startup.sh will still set cache paths." >&2
+fi
 
 # ============================================================
-# 11. Create .env
+# 10. Create .env and generate a private API key if needed
 # ============================================================
 
-# ============================================================
-# 11. Create .env
-# ============================================================
-
-echo ""
-echo "9ä6 Configuring .env..."
-
-if [ ! -f "$PROJECT/.env" ]; then
-
+if [[ ! -f "$PROJECT/.env" ]]; then
     cat > "$PROJECT/.env" <<'ENV_EOF'
-
 APP_NAME=VoxCPM2 Professional Voice API
 APP_VERSION=1.0.0
 API_KEY=8DIEsVE-jyphjyHpTUnBgIgT7dl5b9GA5y5Cz8Cr_AAYyt2ynhED50yE9WGowooF
@@ -247,68 +289,55 @@ OUTPUT_CODEC=libopus
 HOST=0.0.0.0
 PORT=8000
 ENV_EOF
-
-    echo "7½7 .env created"
-
+    echo "Created $PROJECT/.env"
 else
-
-    echo "✓ .env already exists - keeping existing configuration"
-
+    echo "Keeping existing $PROJECT/.env"
 fi
 
 if ! grep -q '^API_KEY=' "$PROJECT/.env" \
     || grep -Eq '^API_KEY=(CHANGE_ME_TO_A_LONG_RANDOM_SECRET|change-me)?$' "$PROJECT/.env"; then
-
     GENERATED_API_KEY="$("$PYTHON_BIN" -c 'import secrets; print(secrets.token_urlsafe(32))')"
+
     if grep -q '^API_KEY=' "$PROJECT/.env"; then
         sed -i "s/^API_KEY=.*/API_KEY=$GENERATED_API_KEY/" "$PROJECT/.env"
     else
         printf '\nAPI_KEY=%s\n' "$GENERATED_API_KEY" >> "$PROJECT/.env"
     fi
-    unset GENERATED_API_KEY
-    echo "✓ Replaced the default API key with a random secret in .env"
 
+    unset GENERATED_API_KEY
+    echo "Generated a new random API key in $PROJECT/.env"
 fi
 
 # ============================================================
-# 12. Create startup.sh
+# 11. Create startup.sh (preserves original GPU/API startup steps)
 # ============================================================
 
-echo ""
-echo "9ß5 Creating startup.sh..."
+{
+    printf '%s\n' '#!/usr/bin/env bash' 'set -Eeuo pipefail'
+    printf 'PROJECT=%q\n' "$PROJECT"
+    printf 'HF_HOME=%q\n' "$HF_HOME"
+    printf 'HUGGINGFACE_HUB_CACHE=%q\n' "$HUGGINGFACE_HUB_CACHE"
+    printf 'XDG_CACHE_HOME=%q\n' "$XDG_CACHE_HOME"
 
-cat > "$PROJECT/startup.sh" <<'STARTUP_EOF'
-#!/usr/bin/env bash
-set -e
+    cat <<'STARTUP_EOF'
 
-PROJECT="/workspace/voxcpm-api-complete2"
 PYTHON="$PROJECT/.venv/bin/python"
-
-export HF_HOME="/workspace/.cache/huggingface"
-export HUGGINGFACE_HUB_CACHE="/workspace/.cache/huggingface/hub"
-export XDG_CACHE_HOME="/workspace/.cache"
-
+export HF_HOME HUGGINGFACE_HUB_CACHE XDG_CACHE_HOME
 cd "$PROJECT"
 
 echo ""
 echo "============================================================"
-echo "04 VoxCPM API"
+echo "VoxCPM API"
 echo "============================================================"
-
-echo "9Ü8 Project: $PROJECT"
-echo "9Ê7 Python:  $PYTHON"
-echo "9Á2 GPU:     ${RUNPOD_GPU_NAME:-Unknown}"
-echo "9ß9 Host:    ${HOST:-0.0.0.0}"
-echo "9ä2 Port:    ${PORT:-8000}"
+echo "Project: $PROJECT"
+echo "Python:  $PYTHON"
+echo "GPU:     ${RUNPOD_GPU_NAME:-Unknown}"
+echo "Host:    ${HOST:-0.0.0.0}"
+echo "Port:    ${PORT:-8000}"
 
 echo ""
-
-# ============================================================
-# GPU CHECK
-# ============================================================
-
 echo "============================================================"
-echo "9Á2 GPU CHECK"
+echo "GPU / PyTorch CHECK"
 echo "============================================================"
 
 "$PYTHON" - <<'PY'
@@ -318,134 +347,87 @@ print("PyTorch:", torch.__version__)
 print("CUDA available:", torch.cuda.is_available())
 
 if torch.cuda.is_available():
-
     print("CUDA:", torch.version.cuda)
     print("GPU:", torch.cuda.get_device_name(0))
     print("GPU count:", torch.cuda.device_count())
-
 else:
-
-    print("7²2 WARNING: CUDA is not available")
-
+    print("WARNING: CUDA is unavailable; inference will depend on CPU support and memory.")
 PY
 
-echo ""
-
-# ============================================================
-# RunPod Public URL
-# ============================================================
-
-if [ -n "${RUNPOD_POD_ID:-}" ]; then
-
+if [[ -n "${RUNPOD_POD_ID:-}" ]]; then
     PUBLIC_URL="https://${RUNPOD_POD_ID}-${PORT:-8000}.proxy.runpod.net"
-
-    echo "============================================================"
-    echo "9±1 RUNPOD"
-    echo "============================================================"
-
-    echo "Public URL:"
-    echo "$PUBLIC_URL"
-
     echo ""
-    echo "Swagger:"
-    echo "$PUBLIC_URL/docs"
-
-    echo ""
-    echo "OpenAPI:"
-    echo "$PUBLIC_URL/openapi.json"
-
+    echo "RunPod URL: $PUBLIC_URL"
+    echo "Swagger:    $PUBLIC_URL/docs"
+    echo "OpenAPI:    $PUBLIC_URL/openapi.json"
 fi
 
 echo ""
-echo "============================================================"
-echo "04 STARTING API"
-echo "============================================================"
-echo ""
-
+echo "Starting API..."
 exec "$PYTHON" -m uvicorn app.main:app \
     --host "${HOST:-0.0.0.0}" \
     --port "${PORT:-8000}" \
     --workers 1
-
 STARTUP_EOF
+} > "$PROJECT/startup.sh"
 
 chmod +x "$PROJECT/startup.sh"
 
 # ============================================================
-# 13. Installation Check
+# 12. Installation checks (Python packages and FFmpeg tools )
 # ============================================================
-
-echo ""
-echo "============================================================"
-echo "9ä3 INSTALLATION CHECK"
-echo "============================================================"
 
 "$PYTHON_BIN" - <<'PY'
+import importlib.util
 import sys
 
-print("Python:", sys.version )
+import fastapi
+import torch
+import uvicorn
 
-try:
+print("Python:", sys.version.split()[0])
+print("PyTorch:", torch.__version__)
+print("CUDA available:", torch.cuda.is_available())
+print("FastAPI:", fastapi.__version__)
+print("Uvicorn:", uvicorn.__version__)
 
-    import torch
-
-    print("PyTorch:", torch.__version__)
-    print("CUDA available:", torch.cuda.is_available())
-
-    if torch.cuda.is_available():
-
-        print("CUDA version:", torch.version.cuda)
-        print("GPU:", torch.cuda.get_device_name(0))
-
-except Exception as e:
-
-    print("PyTorch error:", e)
-
-
-try:
-
-    import fastapi
-
-    print("FastAPI:", fastapi.__version__)
-
-except Exception:
-
-    print("FastAPI: NOT FOUND")
-
-
-try:
-
-    import uvicorn
-
-    print("Uvicorn:", uvicorn.__version__)
-
-except Exception:
-
-    print("Uvicorn: NOT FOUND")
-
+for module in (
+    "multipart",
+    "psycopg",
+    "pydantic_settings",
+    "numpy",
+    "scipy",
+    "soundfile",
+    "librosa",
+):
+    if importlib.util.find_spec(module) is None:
+        raise SystemExit(f"Required module is missing: {module}")
+    print(f"{module}: OK")
 PY
 
-# ============================================================
-# 14. Cache Configuration
-# ============================================================
+PYTHONPATH="$PROJECT${PYTHONPATH:+:$PYTHONPATH}" "$PYTHON_BIN" - <<'PY'
+from app.main import app
+
+print("FastAPI app import: OK")
+print("Registered routes:", len(app.routes))
+PY
+
+ffmpeg -version | head -n 1
+ffprobe -version | head -n 1
+"$PYTHON_BIN" -m pip check
 
 echo ""
 echo "============================================================"
-echo "7±515 CACHE CONFIGURATION"
-echo "============================================================"
-
-echo "HF_HOME=$HF_HOME"
-echo "HUGGINGFACE_HUB_CACHE=$HUGGINGFACE_HUB_CACHE"
-echo "XDG_CACHE_HOME=$XDG_CACHE_HOME"
-
-# ============================================================
-# 15. Start API
-# ============================================================
-
-echo ""a
-echo "============================================================"
-echo "04 STARTING VOXCPM API"
+echo "Installation checks passed."
+echo "Workspace: $BASE_DIR"
+echo "Project:   $PROJECT"
+echo "Cache:     $CACHE_DIR"
+echo "To run later: $PROJECT/startup.sh"
 echo "============================================================"
 echo ""
+
+# ============================================================
+# 13. Start API (same final behavior as the original script)
+# ============================================================
 
 exec "$PROJECT/startup.sh"
