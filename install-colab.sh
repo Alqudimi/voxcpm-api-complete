@@ -1,563 +1,518 @@
-#!/usr/bin/env bash
+%%bash
 set -Eeuo pipefail
 
 # ============================================================
-# VoxCPM API + Audio Mixer
-# Google Colab Setup & Startup
+# VoxCPM API + Cloudflare Quick Tunnel
+# Google Colab — Defensive Startup Script
 #
-# - No Google Drive integration
-# - Temporary local workspace
-# - GPU/CUDA diagnostics
-# - FFmpeg + libopus verification
-# - FastAPI startup
-# - Temporary public URL through Cloudflare Tunnel
+# - Reuses an existing project and API when possible
+# - Preserves existing .env and API_KEY
+# - Bounded startup and validation retries
+# - Detects local API and tunnel failures
+# - Does not claim success without HTTP validation
+# - Cleans up only processes started by this script
 # ============================================================
 
 export DEBIAN_FRONTEND=noninteractive
 export PIP_DISABLE_PIP_VERSION_CHECK=1
 
-REPO="${REPO_URL:-https://github.com/Alqudimi/voxcpm-api-complete.git}"
-PROJECT_NAME="voxcpm-api-complete"
+# -----------------------------
+# Configuration
+# -----------------------------
 
-# ============================================================
-# 1. Workspace
-# ============================================================
-
-BASE_DIR="${WORKSPACE_DIR:-/content/workspace}"
-PROJECT="${PROJECT_DIR:-$BASE_DIR/$PROJECT_NAME}"
+REPO_URL="${REPO_URL:-https://github.com/Alqudimi/voxcpm-api-complete.git}"
+PROJECT="${PROJECT_DIR:-/content/workspace/voxcpm-api-complete}"
 CACHE_DIR="${CACHE_DIR:-/content/cache}"
 
-mkdir -p "$BASE_DIR" "$CACHE_DIR" "$(dirname "$PROJECT")"
+PORT="${PORT:-8000}"
+HOST="0.0.0.0"
+
+API_LOG="/content/voxcpm-api.log"
+TUNNEL_LOG="/content/cloudflared.log"
+TUNNEL_STDOUT="/content/cloudflared.stdout.log"
+
+LOCAL_READY_ATTEMPTS=45
+TUNNEL_START_ATTEMPTS=3
+TUNNEL_URL_ATTEMPTS=20
+PUBLIC_CHECK_ATTEMPTS=6
+
+API_PID=""
+TUNNEL_PID=""
+TAIL_PID=""
+PUBLIC_URL=""
+
+mkdir -p "$(dirname "$PROJECT")" "$CACHE_DIR"
 
 export HF_HOME="${HF_HOME:-$CACHE_DIR/huggingface}"
 export HUGGINGFACE_HUB_CACHE="${HUGGINGFACE_HUB_CACHE:-$HF_HOME/hub}"
 export XDG_CACHE_HOME="${XDG_CACHE_HOME:-$CACHE_DIR}"
 
-mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$XDG_CACHE_HOME/whisper"
+mkdir -p "$HF_HOME" "$HUGGINGFACE_HUB_CACHE" "$XDG_CACHE_HOME"
 
-printf '\n%s\n' '============================================================'
-printf '%s\n' 'VoxCPM API — Google Colab'
-printf '%s\n\n' '============================================================'
-printf 'Workspace: %s\nProject:   %s\nCache:     %s\nRepository: %s\n\n' \
-    "$BASE_DIR" "$PROJECT" "$CACHE_DIR" "$REPO"
+# -----------------------------
+# Logging
+# -----------------------------
 
-# ============================================================
-# 2. Check Colab environment
-# ============================================================
+log() {
+    printf '\n[%s] %s\n' "$(date '+%H:%M:%S')" "$*"
+}
 
-if [[ ! -d /content ]]; then
-    echo "ERROR: This script is intended for Google Colab." >&2
+fail() {
+    printf '\nERROR: %s\n' "$*" >&2
     exit 1
-fi
+}
 
-PYTHON_SYSTEM="${PYTHON_SYSTEM:-python3}"
+# -----------------------------
+# Cleanup
+# -----------------------------
 
-if ! command -v "$PYTHON_SYSTEM" >/dev/null 2>&1; then
-    echo "ERROR: Python is not installed." >&2
-    exit 1
-fi
+cleanup() {
+    local exit_code=$?
 
-"$PYTHON_SYSTEM" - <<'PY'
+    trap - EXIT INT TERM
+
+    log "Cleaning up processes started by this script..."
+
+    if [[ -n "${TAIL_PID:-}" ]]; then
+        kill "$TAIL_PID" 2>/dev/null || true
+        wait "$TAIL_PID" 2>/dev/null || true
+    fi
+
+    if [[ -n "${TUNNEL_PID:-}" ]]; then
+        kill "$TUNNEL_PID" 2>/dev/null || true
+        wait "$TUNNEL_PID" 2>/dev/null || true
+    fi
+
+    if [[ -n "${API_PID:-}" ]]; then
+        kill "$API_PID" 2>/dev/null || true
+        wait "$API_PID" 2>/dev/null || true
+    fi
+
+    if [[ "$exit_code" -ne 0 ]]; then
+        log "Script exited with code $exit_code."
+        log "API log: $API_LOG"
+        log "Tunnel log: $TUNNEL_LOG"
+    fi
+}
+
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# -----------------------------
+# 1. Validate Colab
+# -----------------------------
+
+log "VoxCPM API — Google Colab + Cloudflare Tunnel"
+
+[[ -d /content ]] || fail "This script requires Google Colab."
+
+command -v python3 >/dev/null 2>&1 ||
+    fail "python3 is not installed."
+
+command -v curl >/dev/null 2>&1 ||
+    fail "curl is not installed."
+
+command -v git >/dev/null 2>&1 ||
+    fail "git is not installed."
+
+PYTHON_BIN="$(command -v python3)"
+
+"$PYTHON_BIN" - <<'PY'
 import sys
 
 print("Python:", sys.version)
 if sys.version_info < (3, 11):
-    raise SystemExit("ERROR: Python 3.11 or newer is required.")
+    raise SystemExit("Python 3.11 or newer is required.")
 PY
 
-if ! command -v git >/dev/null 2>&1; then
-    apt-get update
-    apt-get install -y git
-fi
+log "Project: $PROJECT"
+log "Python:  $PYTHON_BIN"
+log "Port:    $PORT"
 
-# ============================================================
-# 3. Clone or reuse the repository
-# ============================================================
+# -----------------------------
+# 2. Reuse or clone project
+# -----------------------------
 
 if [[ -d "$PROJECT/.git" ]]; then
-    echo "Existing Git checkout found: $PROJECT"
+    log "Existing Git checkout found."
 
-    cd "$PROJECT"
+elif [[ -f "$PROJECT/app/main.py" &&
+        -f "$PROJECT/requirements.txt" ]]; then
+    log "Existing project files found without Git metadata."
+    log "Using the existing project without overwriting it."
 
-    if ! git pull --ff-only; then
-        echo "WARNING: Git update failed; using the existing checkout." >&2
-    fi
+elif [[ ! -e "$PROJECT" ]]; then
+    log "Cloning repository..."
+
+    git clone --depth 1 "$REPO_URL" "$PROJECT" ||
+        fail "Could not clone the repository."
+
 else
-    if [[ -e "$PROJECT" ]]; then
-        if [[ -n "$(find "$PROJECT" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
-            echo "ERROR: The project directory exists but is not an empty Git checkout." >&2
-            echo "Set PROJECT_DIR to another directory or move the existing directory." >&2
-            exit 1
-        fi
-
-        rmdir "$PROJECT"
-    fi
-
-    echo "Cloning project..."
-    git clone "$REPO" "$PROJECT"
+    fail "Project directory exists but is not a valid project. Set PROJECT_DIR to another directory."
 fi
+
+[[ -f "$PROJECT/app/main.py" ]] ||
+    fail "Missing app/main.py."
+
+[[ -f "$PROJECT/requirements.txt" ]] ||
+    fail "Missing requirements.txt."
 
 cd "$PROJECT"
 
-if [[ ! -f requirements.txt ]]; then
-    echo "ERROR: requirements.txt is missing." >&2
-    exit 1
+# -----------------------------
+# 3. Verify system tools
+# -----------------------------
+
+log "Checking FFmpeg..."
+
+if ! command -v ffmpeg >/dev/null 2>&1 ||
+   ! command -v ffprobe >/dev/null 2>&1; then
+
+    apt-get update
+    apt-get install -y --no-install-recommends ffmpeg ca-certificates curl git
 fi
 
-if [[ ! -f app/audio_mixer/api.py ]] || \
-   ! grep -q 'include_audio_mixer' app/main.py; then
-    echo "ERROR: Audio Mixer source or FastAPI registration is missing." >&2
-    exit 1
-fi
+command -v ffmpeg >/dev/null 2>&1 ||
+    fail "FFmpeg installation failed."
 
-# ============================================================
-# 4. Install system dependencies
-# ============================================================
+command -v ffprobe >/dev/null 2>&1 ||
+    fail "ffprobe installation failed."
 
-echo ""
-echo "Installing system dependencies..."
+ffmpeg -version | head -n 1
 
-apt-get update
-apt-get install -y --no-install-recommends \
-    ffmpeg \
-    ca-certificates \
-    curl \
-    git
+FFMPEG_ENCODERS="$(ffmpeg -hide_banner -encoders 2>/dev/null || true)"
 
-if ! command -v ffmpeg >/dev/null 2>&1; then
-    echo "ERROR: FFmpeg installation failed." >&2
-    exit 1
-fi
+grep -Eq '[[:space:]]libopus([[:space:]]|$)' <<<"$FFMPEG_ENCODERS" ||
+    fail "FFmpeg does not provide the libopus encoder."
 
-if ! command -v ffprobe >/dev/null 2>&1; then
-    echo "ERROR: ffprobe is unavailable." >&2
-    exit 1
-fi
+log "FFmpeg and libopus are available."
 
-FFMPEG_ENCODERS="$(ffmpeg -hide_banner -encoders 2>/dev/null)"
+# -----------------------------
+# 4. Validate Python environment
+# -----------------------------
 
-if ! grep -Eq '[[:space:]]libopus([[:space:]]|$)' <<<"$FFMPEG_ENCODERS"; then
-    echo "ERROR: FFmpeg does not provide the libopus encoder." >&2
-    exit 1
-fi
-
-echo "FFmpeg: $(ffmpeg -version | head -n 1)"
-echo "ffprobe: $(ffprobe -version | head -n 1)"
-echo "libopus: OK"
-
-# ============================================================
-# 5. Python environment
-#
-# Colab already provides a managed Python environment.
-# Reuse it instead of creating a venv that may duplicate
-# large CUDA/PyTorch packages.
-# ============================================================
-
-PYTHON_BIN="$(command -v "$PYTHON_SYSTEM")"
-
-echo ""
-echo "Python executable: $PYTHON_BIN"
-
-"$PYTHON_BIN" -m pip install --upgrade pip setuptools wheel
-
-# ============================================================
-# 6. Check the existing PyTorch/CUDA installation
-#
-# Do not replace Colab's PyTorch automatically. Installing
-# another CUDA wheel can break packages preinstalled by Colab.
-# ============================================================
-
-echo ""
-echo "Checking PyTorch and GPU..."
-
-if ! "$PYTHON_BIN" -c 'import torch' 2>/dev/null; then
-    echo "PyTorch is missing; installing a compatible CUDA wheel."
-
-    "$PYTHON_BIN" -m pip install torch torchvision torchaudio
-fi
-
-"$PYTHON_BIN" - <<'PY'
-import torch
-
-print("PyTorch:", torch.__version__)
-print("CUDA available:", torch.cuda.is_available())
-print("PyTorch CUDA runtime:", torch.version.cuda)
-
-if torch.cuda.is_available():
-    print("GPU count:", torch.cuda.device_count())
-
-    for i in range(torch.cuda.device_count()):
-        print(f"GPU {i}:", torch.cuda.get_device_name(i))
-
-    try:
-        x = torch.randn(1024, 1024, device="cuda")
-        y = x @ x
-        torch.cuda.synchronize()
-        print("CUDA computation: OK")
-    except Exception as exc:
-        raise SystemExit(f"ERROR: CUDA computation failed: {exc}")
-else:
-    print("WARNING: No CUDA GPU detected.")
-    print("In Colab, select Runtime > Change runtime type > GPU.")
-PY
-
-# ============================================================
-# 7. Install project requirements
-#
-# Preserve the requirements.txt file.
-# Avoid reinstalling pinned torch packages from it.
-# ============================================================
-
-FILTERED_REQUIREMENTS="$(mktemp /content/requirements-colab.XXXXXX.txt)"
-trap 'rm -f "$FILTERED_REQUIREMENTS"' EXIT
-
-sed -E \
-    '/^[[:space:]]*torch([[:space:]]|[<=>!~]|$)/d' \
-    requirements.txt > "$FILTERED_REQUIREMENTS"
-
-echo ""
-echo "Installing project requirements..."
-
-if ! "$PYTHON_BIN" -m pip install -r "$FILTERED_REQUIREMENTS"; then
-    echo "ERROR: Project requirements installation failed." >&2
-    exit 1
-fi
-
-rm -f "$FILTERED_REQUIREMENTS"
-trap - EXIT
-
-# ============================================================
-# 8. Install Audio Mixer dependencies
-# ============================================================
-
-echo ""
-echo "Installing Audio Mixer runtime dependencies..."
-
-"$PYTHON_BIN" -m pip install \
-    'fastapi>=0.115' \
-    'uvicorn[standard]>=0.34' \
-    'python-multipart>=0.0.20' \
-    'pydantic>=2.10' \
-    'pydantic-settings>=2.7' \
-    'numpy>=1.26' \
-    scipy \
-    soundfile \
-    librosa \
-    'psycopg[binary]>=3.2'
-
-# ============================================================
-# 9. Create .env without overwriting an existing configuration
-# ============================================================
-
-if [[ ! -f "$PROJECT/.env" ]]; then
-    echo "Creating .env..."
-
-    cat > "$PROJECT/.env" <<'ENV_EOF'
-APP_NAME=VoxCPM2 Professional Voice API
-APP_VERSION=1.0.0
-API_KEY=CHANGE_ME_TO_A_LONG_RANDOM_SECRET
-
-VOXCPM_MODEL_ID=openbmb/VoxCPM2
-WHISPER_MODEL_NAME=large-v3
-ECAPA_SOURCE=speechbrain/spkrec-ecapa-voxceleb
-ECAPA_SAVEDIR=storage/models/ecapa_voxceleb
-
-DEVICE=cuda
-REFERENCE_SAMPLE_RATE=16000
-OUTPUT_SAMPLE_RATE=48000
-AUDIO_SAMPLE_RATE=24000
-
-MAX_FILE_SIZE_MB=100
-MAX_MERGE_FILES=20
-
-DEFAULT_CFG=2.0
-DEFAULT_TIMESTEPS=30
-DEFAULT_CANDIDATES=3
-DEFAULT_RETRY_BADCASE=true
-DEFAULT_RETRY_MAX_TIMES=3
-DEFAULT_RETRY_RATIO_THRESHOLD=6.0
-
-OUTPUT_BITRATE=96k
-OUTPUT_CODEC=libopus
-
-HOST=0.0.0.0
-PORT=8000
-ENV_EOF
-fi
-
-# Replace only the known placeholder, not a real existing key.
-if grep -Eq '^API_KEY=(CHANGE_ME_TO_A_LONG_RANDOM_SECRET|change-me)?$' "$PROJECT/.env"; then
-    GENERATED_API_KEY="$("$PYTHON_BIN" -c 'import secrets; print(secrets.token_urlsafe(32))')"
-
-    API_KEY="$GENERATED_API_KEY" PROJECT_ENV="$PROJECT/.env" \
-    "$PYTHON_BIN" - <<'PY'
-import os
-from pathlib import Path
-
-path = Path(os.environ["PROJECT_ENV"])
-key = os.environ["API_KEY"]
-lines = path.read_text().splitlines()
-
-found = False
-for i, line in enumerate(lines):
-    if line.startswith("API_KEY="):
-        lines[i] = f"API_KEY={key}"
-        found = True
-
-if not found:
-    lines.append(f"API_KEY={key}")
-
-path.write_text("\n".join(lines) + "\n")
-PY
-
-    unset GENERATED_API_KEY
-    echo "Generated a random API key in .env."
-fi
-
-chmod 600 "$PROJECT/.env"
-
-# ============================================================
-# 10. Validate Python dependencies
-# ============================================================
-
-echo ""
-echo "Checking installed dependencies..."
+log "Checking Python dependencies..."
 
 "$PYTHON_BIN" - <<'PY'
 import importlib.util
-import sys
+
+required = [
+    "torch",
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+]
+
+missing = [name for name in required if importlib.util.find_spec(name) is None]
+
+if missing:
+    print("Missing Python modules:", ", ".join(missing))
+    raise SystemExit(1)
 
 import torch
 import fastapi
 import uvicorn
 
-print("Python:", sys.version.split()[0])
 print("PyTorch:", torch.__version__)
 print("FastAPI:", fastapi.__version__)
 print("Uvicorn:", uvicorn.__version__)
+print("CUDA available:", torch.cuda.is_available())
 
-for module in (
-    "multipart",
-    "psycopg",
-    "pydantic_settings",
-    "numpy",
-    "scipy",
-    "soundfile",
-    "librosa",
-):
-    if importlib.util.find_spec(module) is None:
-        raise SystemExit(f"Missing dependency: {module}")
-
-    print(f"{module}: OK")
+if torch.cuda.is_available():
+    print("GPU:", torch.cuda.get_device_name(0))
 PY
 
-# pip check is informative here; Colab may have unrelated
-# preinstalled packages with constraints outside this project.
-if ! "$PYTHON_BIN" -m pip check; then
-    echo "WARNING: pip check reported dependency conflicts." >&2
-    echo "Review the conflicts before relying on the environment." >&2
+# -----------------------------
+# 5. Validate existing .env
+# -----------------------------
+
+if [[ ! -f "$PROJECT/.env" ]]; then
+    log "No .env found. Creating a minimal configuration."
+
+    cat > "$PROJECT/.env" <<'ENV_EOF'
+APP_NAME=VoxCPM2 Professional Voice API
+APP_VERSION=1.0.0
+API_KEY=CHANGE_ME_TO_A_LONG_RANDOM_SECRET
+VOXCPM_MODEL_ID=openbmb/VoxCPM2
+DEVICE=cuda
+HOST=0.0.0.0
+PORT=8000
+ENV_EOF
+
+    chmod 600 "$PROJECT/.env"
 fi
 
-# ============================================================
-# 11. Verify FastAPI registration
-# ============================================================
+if grep -Eq '^API_KEY=(CHANGE_ME_TO_A_LONG_RANDOM_SECRET|change-me)?$' "$PROJECT/.env"; then
+    log "Replacing the placeholder API key."
 
-echo ""
-echo "Checking FastAPI application..."
+    API_KEY_VALUE="$("$PYTHON_BIN" -c 'import secrets; print(secrets.token_urlsafe(32))')"
+    export API_KEY_VALUE
 
-PYTHONPATH="$PROJECT${PYTHONPATH:+:$PYTHONPATH}" \
-"$PYTHON_BIN" - <<'PY'
-from app.main import app
+    "$PYTHON_BIN" - <<'PY'
+import os
+from pathlib import Path
 
-print("FastAPI import: OK")
-print("Registered routes:", len(app.routes))
+path = Path(os.environ["PROJECT_DIR"]) / ".env"
+key = os.environ["API_KEY_VALUE"]
 
-for route in app.routes:
-    path = getattr(route, "path", None)
-    methods = getattr(route, "methods", None)
+lines = path.read_text().splitlines()
+found = False
 
-    if path:
-        print(f"{','.join(sorted(methods or [])):20} {path}")
+for i, line in enumerate(lines):
+    if line.startswith("API_KEY="):
+        lines[i] = "API_KEY=" + key
+        found = True
+
+if not found:
+    lines.append("API_KEY=" + key)
+
+path.write_text("\n".join(lines) + "\n")
 PY
+fi
 
-# ============================================================
-# 12. Install Cloudflare Tunnel (cloudflared)
-#
-# Uses Cloudflare Quick Tunnel. No Cloudflare account or
-# domain is required for a temporary trycloudflare.com URL.
-# ============================================================
+chmod 600 "$PROJECT/.env"
 
-echo ""
-echo "Installing Cloudflare Tunnel..."
+# -----------------------------
+# 6. Install cloudflared
+# -----------------------------
 
-ARCH="$(uname -m)"
+log "Checking cloudflared..."
 
-case "$ARCH" in
-    x86_64)
-        CLOUDFLARED_ARCH="amd64"
-        ;;
-    aarch64|arm64)
-        CLOUDFLARED_ARCH="arm64"
-        ;;
-    *)
-        echo "ERROR: Unsupported architecture: $ARCH" >&2
-        exit 1
-        ;;
-esac
+if ! command -v cloudflared >/dev/null 2>&1; then
+    ARCH="$(uname -m)"
 
-CLOUDFLARED_TMP="$(mktemp /content/cloudflared.XXXXXX)"
-trap 'rm -f "$CLOUDFLARED_TMP"' EXIT
+    case "$ARCH" in
+        x86_64)
+            CLOUDFLARED_ARCH="amd64"
+            ;;
+        aarch64|arm64)
+            CLOUDFLARED_ARCH="arm64"
+            ;;
+        *)
+            fail "Unsupported architecture: $ARCH"
+            ;;
+    esac
 
-curl -fsSL \
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CLOUDFLARED_ARCH}" \
-    -o "$CLOUDFLARED_TMP"
+    TMP_BIN="$(mktemp /content/cloudflared.XXXXXX)"
 
-install -m 0755 "$CLOUDFLARED_TMP" /usr/local/bin/cloudflared
+    if ! curl -fLsS --retry 3 --connect-timeout 15 \
+        "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${CLOUDFLARED_ARCH}" \
+        -o "$TMP_BIN"; then
+        rm -f "$TMP_BIN"
+        fail "Could not download cloudflared."
+    fi
 
-rm -f "$CLOUDFLARED_TMP"
-trap - EXIT
+    install -m 0755 "$TMP_BIN" /usr/local/bin/cloudflared
+    rm -f "$TMP_BIN"
+fi
 
 cloudflared --version
 
-# ============================================================
-# 13. Start API and Cloudflare Tunnel
-# ============================================================
+# -----------------------------
+# 7. Detect existing local API
+# -----------------------------
 
-PORT="${PORT:-8000}"
-HOST="${HOST:-0.0.0.0}"
+log "Checking local API..."
 
-export PORT HOST
-export HF_HOME HUGGINGFACE_HUB_CACHE XDG_CACHE_HOME
+LOCAL_API_URL="http://127.0.0.1:${PORT}"
+OPENAPI_URL="${LOCAL_API_URL}/openapi.json"
 
-cd "$PROJECT"
+API_ALREADY_RUNNING=0
 
-echo ""
-echo "============================================================"
-echo "Starting VoxCPM API"
-echo "============================================================"
-echo "Project: $PROJECT"
-echo "Host:    $HOST"
-echo "Port:    $PORT"
+if curl -fsS --connect-timeout 3 --max-time 10 \
+    "$OPENAPI_URL" -o /dev/null 2>/dev/null; then
 
-# Launch API in the background so cloudflared can run alongside it.
-"$PYTHON_BIN" -m uvicorn app.main:app \
-    --host "$HOST" \
-    --port "$PORT" \
-    --workers 1 \
-    > /content/voxcpm-api.log 2>&1 &
+    API_ALREADY_RUNNING=1
+    log "An API is already responding on port $PORT."
+    log "Reusing the existing API."
 
-API_PID=$!
+else
+    log "Starting FastAPI..."
 
-cleanup() {
-    echo ""
-    echo "Stopping VoxCPM API and Cloudflare Tunnel..."
+    "$PYTHON_BIN" -m uvicorn app.main:app \
+        --host "$HOST" \
+        --port "$PORT" \
+        --workers 1 \
+        > "$API_LOG" 2>&1 &
 
-    if [[ -n "${TUNNEL_PID:-}" ]]; then
-        kill "$TUNNEL_PID" 2>/dev/null || true
-    fi
-
-    if [[ -n "${API_PID:-}" ]]; then
-        kill "$API_PID" 2>/dev/null || true
-    fi
-
-    wait 2>/dev/null || true
-}
-
-trap cleanup EXIT INT TERM
-
-# Wait for FastAPI to start before opening the tunnel.
-echo "Waiting for FastAPI..."
-
-API_READY=0
-
-for _ in $(seq 1 120); do
-    if ! kill -0 "$API_PID" 2>/dev/null; then
-        echo "ERROR: FastAPI stopped during startup." >&2
-        cat /content/voxcpm-api.log >&2
-        exit 1
-    fi
-
-    if curl -fsS "http://127.0.0.1:${PORT}/openapi.json" \
-        -o /dev/null 2>/dev/null; then
-        API_READY=1
-        break
-    fi
-
-    sleep 2
-done
-
-if [[ "$API_READY" != "1" ]]; then
-    echo "ERROR: FastAPI did not become ready within 240 seconds." >&2
-    cat /content/voxcpm-api.log >&2
-    exit 1
+    API_PID=$!
 fi
 
-echo "FastAPI is responding locally."
+# -----------------------------
+# 8. Wait for local API
+# -----------------------------
 
-# Quick Tunnel outputs its temporary public URL to stderr.
-TUNNEL_LOG="/content/cloudflared.log"
-: > "$TUNNEL_LOG"
+log "Waiting for local API..."
 
-cloudflared tunnel \
-    --url "http://127.0.0.1:${PORT}" \
-    --no-autoupdate \
-    > /content/cloudflared.stdout.log \
-    2> "$TUNNEL_LOG" &
+LOCAL_READY=0
 
-TUNNEL_PID=$!
+for ((i=1; i<=LOCAL_READY_ATTEMPTS; i++)); do
 
-echo ""
-echo "Waiting for Cloudflare URL..."
+    if curl -fsS --connect-timeout 3 --max-time 10 \
+        "$OPENAPI_URL" -o /dev/null 2>/dev/null; then
 
-PUBLIC_URL=""
-
-for _ in $(seq 1 60); do
-    if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-        echo "ERROR: Cloudflare Tunnel stopped unexpectedly." >&2
-        cat "$TUNNEL_LOG" >&2
-        exit 1
+        LOCAL_READY=1
+        break
     fi
 
-    PUBLIC_URL="$(
-        grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" \
-            | head -n 1 || true
-    )"
+    if [[ -n "${API_PID:-}" ]] &&
+       ! kill -0 "$API_PID" 2>/dev/null; then
 
-    if [[ -n "$PUBLIC_URL" ]]; then
-        break
+        log "FastAPI process exited unexpectedly."
+        tail -n 100 "$API_LOG" >&2 || true
+        fail "FastAPI failed during startup."
     fi
 
     sleep 2
 done
+
+[[ "$LOCAL_READY" -eq 1 ]] ||
+    fail "Local API did not respond within the startup deadline."
+
+log "Local API validated successfully."
+
+# -----------------------------
+# 9. Start and validate tunnel
+# -----------------------------
+
+for ((attempt=1; attempt<=TUNNEL_START_ATTEMPTS; attempt++)); do
+
+    log "Starting Cloudflare Quick Tunnel: $attempt/$TUNNEL_START_ATTEMPTS"
+
+    : > "$TUNNEL_LOG"
+    : > "$TUNNEL_STDOUT"
+
+    # Use HTTP/2 to avoid depending on UDP/QUIC connectivity.
+    cloudflared tunnel \
+        --url "$LOCAL_API_URL" \
+        --protocol http2 \
+        --no-autoupdate \
+        > "$TUNNEL_STDOUT" \
+        2> "$TUNNEL_LOG" &
+
+    TUNNEL_PID=$!
+    CANDIDATE_URL=""
+
+    for ((i=1; i<=TUNNEL_URL_ATTEMPTS; i++)); do
+
+        if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+            log "Tunnel process exited before publishing a URL."
+            break
+        fi
+
+        CANDIDATE_URL="$(
+            grep -Eho \
+                'https://[a-zA-Z0-9-]+\.trycloudflare\.com' \
+                "$TUNNEL_LOG" "$TUNNEL_STDOUT" 2>/dev/null \
+                | head -n 1 || true
+        )"
+
+        [[ -n "$CANDIDATE_URL" ]] && break
+
+        sleep 2
+    done
+
+    if [[ -z "$CANDIDATE_URL" ]]; then
+        tail -n 60 "$TUNNEL_LOG" >&2 || true
+
+        kill "$TUNNEL_PID" 2>/dev/null || true
+        wait "$TUNNEL_PID" 2>/dev/null || true
+        TUNNEL_PID=""
+
+        sleep 3
+        continue
+    fi
+
+    log "Cloudflare published a URL. Validating the public API..."
+
+    PUBLIC_READY=0
+
+    for ((i=1; i<=PUBLIC_CHECK_ATTEMPTS; i++)); do
+
+        if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
+            log "Tunnel stopped during public validation."
+            break
+        fi
+
+        HTTP_STATUS="$(
+            curl -sS \
+                --connect-timeout 5 \
+                --max-time 12 \
+                -o /dev/null \
+                -w '%{http_code}' \
+                "${CANDIDATE_URL}/openapi.json" 2>/dev/null \
+                || true
+        )"
+
+        log "Public check $i/$PUBLIC_CHECK_ATTEMPTS: HTTP ${HTTP_STATUS:-connection failed}"
+
+        if [[ "$HTTP_STATUS" == "200" ]]; then
+            PUBLIC_READY=1
+            break
+        fi
+
+        sleep 3
+    done
+
+    if [[ "$PUBLIC_READY" -eq 1 ]]; then
+        PUBLIC_URL="$CANDIDATE_URL"
+        break
+    fi
+
+    log "Public validation failed. Inspecting tunnel logs..."
+    tail -n 50 "$TUNNEL_LOG" >&2 || true
+
+    kill "$TUNNEL_PID" 2>/dev/null || true
+    wait "$TUNNEL_PID" 2>/dev/null || true
+    TUNNEL_PID=""
+
+    sleep 3
+done
+
+# -----------------------------
+# 10. Report failure honestly
+# -----------------------------
 
 if [[ -z "$PUBLIC_URL" ]]; then
-    echo "ERROR: Could not retrieve a public Cloudflare URL." >&2
-    cat "$TUNNEL_LOG" >&2
+    echo
+    echo "============================================================"
+    echo "PUBLIC TUNNEL FAILED"
+    echo "============================================================"
+    echo "Local API: $LOCAL_API_URL"
+    echo "API log: $API_LOG"
+    echo "Tunnel log: $TUNNEL_LOG"
+    echo
+    echo "The local API may still be running."
+    echo "No unverified public URL will be reported as working."
+    echo "============================================================"
+
     exit 1
 fi
 
-echo ""
+# -----------------------------
+# 11. Display validated URL
+# -----------------------------
+
+echo
 echo "============================================================"
-echo "VOXCPM API IS RUNNING"
+echo "VOXCPM API — PUBLIC ENDPOINT VERIFIED"
 echo "============================================================"
 echo "Public API: $PUBLIC_URL"
 echo "Swagger UI: $PUBLIC_URL/docs"
-echo "OpenAPI:    $PUBLIC_URL/openapi.json"
-echo ""
-echo "Local API:  http://127.0.0.1:$PORT"
-echo "API logs:   /content/voxcpm-api.log"
-echo "Tunnel log: /content/cloudflared.log"
-echo ""
-echo "IMPORTANT:"
-echo "1. Keep this Colab cell running."
-echo "2. The URL is temporary and changes when the tunnel restarts."
-echo "3. Colab runtime files disappear when the runtime is deleted."
-echo "4. Protect your API key; do not publish it."
-echo "5. Use the API key required by your project's authentication."
+echo "OpenAPI: $PUBLIC_URL/openapi.json"
+echo "Local API: $LOCAL_API_URL"
+echo "API log: $API_LOG"
+echo "Tunnel log: $TUNNEL_LOG"
+echo
+echo "Public OpenAPI returned HTTP 200."
+echo "Keep this cell running."
+echo "Quick Tunnel URLs are temporary."
+echo "Do not share your API key."
 echo "============================================================"
 
-# Keep this cell active and forward logs until interrupted.
-tail -n 0 -F /content/voxcpm-api.log "$TUNNEL_LOG" &
+# Keep the cell alive while preserving the tunnel.
+tail -n 0 -F "$TUNNEL_LOG" &
 TAIL_PID=$!
 
-wait "$API_PID"
+wait "$TUNNEL_PID"
