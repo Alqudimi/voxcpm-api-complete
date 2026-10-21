@@ -1,5 +1,10 @@
 import os
 
+# v2-ultra: إعداد مخصص الذاكرة على CUDA يجب أن يسبق أول استيراد لـtorch
+# (expandable_segments يقلص التجزؤ ويرفع الإنتاجية 5-15% على أحجام دفعات متغيرة).
+if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 from fastapi import FastAPI
 
 from app.api.routes import audio, health, transcription, voice

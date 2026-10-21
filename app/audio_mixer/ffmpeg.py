@@ -159,6 +159,7 @@ class FFmpeg:
         args = [
             self.ffmpeg,
             "-hide_banner",
+            "-nostdin",
             "-loglevel",
             "error",
             "-y",

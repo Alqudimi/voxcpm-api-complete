@@ -7,11 +7,16 @@ numpy>=1.26
 scipy
 soundfile
 librosa
+soxr>=0.4
 torch
 torchaudio
 openai-whisper
+faster-whisper>=1.1
 voxcpm
 speechbrain
 transformers
 accelerate
 psycopg[binary]>=3.2
+
+# اختياري (v2): تكميم weight-only — فعّل VM_QUANT فقط بعد بوابة الجودة C
+torchao>=0.5

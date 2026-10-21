@@ -29,6 +29,51 @@ class AudioService:
         self._cleanup_last_result = None
         self._cleanup_last_error = None
         self.admin_config = None
+        # ── v2-ultra: تمهيد الوظائف في RAM ──
+        # مدخلات الخلط (source/noise) تعيش في قاموس عملية محلي بدل كتابة
+        # BLOB في SQLite ثم قراءته بعد ثوانٍ — إزالة رحلتي BLOB كاملتين.
+        # سقف ميزانية RAM + سقوط تلقائي إلى مسار BLOB عند التجاوز أو
+        # على PostgreSQL (الثبات عبر العمليات مطلوب هناك).
+        self._ram_jobs: dict = {}
+        self._ram_jobs_lock = threading.Lock()
+        self._ram_jobs_bytes = 0
+        self._ram_jobs_max_bytes = self._ram_budget_bytes()
+
+    def _ram_budget_bytes(self) -> int:
+        try:
+            from app.core.config import settings as app_settings
+
+            # v3: الميزانية تُضبط تلقائياً من حجم RAM عبر AutoTuner (صريح يتفوق)
+            return max(32, int(app_settings.ram_staging_max_mb)) << 20
+        except Exception:
+            return 512 << 20
+
+    def _ram_staging_enabled(self) -> bool:
+        try:
+            from app.core.config import settings as app_settings
+
+            if not app_settings.job_ram_staging:
+                return False
+        except Exception:
+            return False
+        return not getattr(self.db, "primary_postgres", True)  # SQLite فقط
+
+    def _ram_jobs_put(self, jid, source_bytes, noise_bytes) -> bool:
+        payload_size = len(source_bytes) + (len(noise_bytes) if noise_bytes else 0)
+        with self._ram_jobs_lock:
+            if self._ram_jobs_bytes + payload_size > self._ram_jobs_max_bytes:
+                return False
+            self._ram_jobs[jid] = (source_bytes, noise_bytes)
+            self._ram_jobs_bytes += payload_size
+        return True
+
+    def _ram_jobs_pop(self, jid):
+        with self._ram_jobs_lock:
+            payload = self._ram_jobs.pop(jid, None)
+            if payload is not None:
+                size = len(payload[0]) + (len(payload[1]) if payload[1] else 0)
+                self._ram_jobs_bytes = max(0, self._ram_jobs_bytes - size)
+        return payload
 
     def _setting(self, service_name, key, default):
         if self.admin_config is None:
@@ -101,25 +146,6 @@ class AudioService:
 
     def stop_cleanup_worker(self):
         self._cleanup_stop.set()
-
-    def fail_orphaned_memory_jobs(self):
-        """Mark volatile-input jobs from a previous process as unrecoverable."""
-        if not self.settings.memory_job_inputs:
-            return 0
-        with self.db.connect() as connection:
-            cursor = connection.execute(
-                "UPDATE jobs SET status=?,failed_at=?,error_code=?,error_message=? "
-                "WHERE status IN (?,?) AND configuration_json LIKE ?",
-                (
-                    "failed", now(), "worker_restarted",
-                    "Volatile job inputs were lost when the service process restarted",
-                    "queued", "processing", '%"storage": "worker_memory"%',
-                ),
-            )
-        count = max(0, int(getattr(cursor, "rowcount", 0)))
-        if count:
-            logger.warning("Marked %d orphaned worker_memory jobs as failed", count)
-        return count
 
     def _temp_file(self, data, suffix=".audio"):
         with NamedTemporaryFile(
@@ -330,18 +356,20 @@ class AudioService:
         variation_seed=None,
         output_format="wav",
         noise_metadata=None,
-        persist_inputs=True,
     ):
         output_format = self.resolve_output_format(output_format)
         if not -60 <= source_gain <= 6 or not -60 <= noise_gain <= 6:
             raise ValidationError("Gain must be between -60 and +6 dB")
         jid = new_id()
+        ram_staged = False
+        if self._ram_staging_enabled():
+            ram_staged = self._ram_jobs_put(jid, source_bytes, noise_bytes)
         cfg = {
             "source_gain_db": source_gain,
             "noise_gain_db": noise_gain,
             "noise_extension_seconds": self._setting("jobs", "noise_extension_seconds", self.settings.min_noise_margin_seconds),
-            "pipeline_version": "2.0.0",
-            "storage": "postgresql_bytea" if persist_inputs else "worker_memory",
+            "pipeline_version": "2.1.0",
+            "storage": "ram_staging" if ram_staged else "postgresql_bytea",
             "variation_seed": variation_seed
             if variation_seed is not None
             else secrets.randbits(64),
@@ -367,16 +395,12 @@ class AudioService:
                     f"db://jobs/{jid}/output",
                     "{}",
                     None,
-                    source_bytes if persist_inputs else None,
-                    noise_bytes if persist_inputs else None,
+                    None if ram_staged else source_bytes,
+                    (None if ram_staged else noise_bytes),
                     None,
                 ),
             )
-        threading.Thread(
-            target=self._run,
-            args=(jid, None if persist_inputs else source_bytes, None if persist_inputs else noise_bytes),
-            daemon=True,
-        ).start()
+        threading.Thread(target=self._run, args=(jid,), daemon=True).start()
         return jid
 
     def submit_mix(
@@ -516,7 +540,7 @@ class AudioService:
             noise_gain,
         )
 
-    def _run(self, jid, source_bytes=None, noise_bytes=None):
+    def _run(self, jid):
         if not self.executor.acquire(timeout=1):
             with self.db.connect() as c:
                 c.execute(
@@ -525,8 +549,8 @@ class AudioService:
                 )
             return
         started = time.time()
-        logger.info("audio_job_stage job_id=%s stage=mix_started", jid)
         source = noise = output = None
+        ram_payload = None
         try:
             with self.db.connect() as c:
                 row = c.execute(
@@ -538,14 +562,25 @@ class AudioService:
                     ("processing", now(), jid),
                 )
             configuration = json.loads(row["configuration_json"] or "{}")
-            source_payload = source_bytes if source_bytes is not None else row["source_audio"]
-            noise_payload = noise_bytes if noise_bytes is not None else row["noise_audio"]
-            if source_payload is None:
-                raise ValidationError("Job input payload is unavailable after process restart")
-            source = self._temp_file(bytes(source_payload), Path(row["source_reference"] or "source.audio").suffix or ".source")
+            # ── v2: مدخلات من RAM staging (بلا BLOB) أو من DB كالسابق ──
+            if row["source_audio"] is None:
+                ram_payload = self._ram_jobs_pop(jid)
+                if ram_payload is None:
+                    raise ValidationError(
+                        "Job payload was staged in RAM and lost (process restart?) — resubmit the job"
+                    )
+                source_data, noise_data = ram_payload
+            else:
+                source_data = bytes(row["source_audio"])
+                noise_data = bytes(row["noise_audio"]) if row["noise_audio"] is not None else None
+            source = self._temp_file(
+                source_data, Path(row["source_reference"] or "source.audio").suffix or ".source"
+            )
             noise = (
-                self._temp_file(bytes(noise_payload), Path(row["noise_reference"] or "noise.audio").suffix or ".noise")
-                if noise_payload is not None
+                self._temp_file(
+                    noise_data, Path(row["noise_reference"] or "noise.audio").suffix or ".noise"
+                )
+                if noise_data is not None
                 else None
             )
             source_meta = self._validate_input_duration(source)
@@ -583,7 +618,21 @@ class AudioService:
                 source_metadata=source_meta,
                 noise_metadata=noise_meta,
             )
-            meta = self.ffmpeg.probe(output)
+            # ── v2: تجاوز ffprobe على الخرج — الخصائص معروفة حسابياً من الخلط ──
+            if self._skip_output_probe():
+                meta = dict(source_meta)
+                meta.update(
+                    {
+                        "duration": mix_metrics.get("output_duration", meta.get("duration")),
+                        "sample_rate": 48000,
+                        "channels": 2,
+                        "codec": (self.ffmpeg.output_spec(output_format)["codec_args"][1]),
+                        "format": output_format,
+                        "probe": "derived",
+                    }
+                )
+            else:
+                meta = self.ffmpeg.probe(output)
             meta.update(mix_metrics or {})
             output_bytes = output.read_bytes()
             with self.db.connect() as c:
@@ -598,7 +647,6 @@ class AudioService:
                         jid,
                     ),
                 )
-            logger.info("audio_job_stage job_id=%s stage=mix_completed seconds=%.4f", jid, time.time() - started)
         except Exception as exc:
             try:
                 with self.db.connect() as c:
@@ -621,7 +669,17 @@ class AudioService:
             for path in (source, noise, output):
                 if path:
                     path.unlink(missing_ok=True)
+            if ram_payload is not None:  # تنظيف أي بقايا RAM عند مسار الفشل
+                self._ram_jobs_pop(jid)
             self.executor.release()
+
+    def _skip_output_probe(self) -> bool:
+        try:
+            from app.core.config import settings as app_settings
+
+            return app_settings.skip_output_probe
+        except Exception:
+            return False
 
     def job(self, jid):
         with self.db.connect() as c:

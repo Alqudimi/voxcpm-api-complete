@@ -196,7 +196,16 @@ class Database:
         connection = sqlite3.connect(path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
-        connection.execute("PRAGMA synchronous=NORMAL")
+        # VM_DB_WAL: الوضع الوسيط WAL — القراءة لا يحجبها الكاتب، وأداء أعلى
+        # بكثير في أغلب السيناريوهات (توثيق SQLite الرسمي).
+        if os.getenv("VM_DB_WAL", "on").strip().lower() in {"1", "true", "yes", "on"}:
+            try:
+                connection.execute("PRAGMA journal_mode=WAL")
+                connection.execute("PRAGMA synchronous=NORMAL")
+                connection.execute("PRAGMA busy_timeout=5000")
+            except sqlite3.DatabaseError:
+                # بعض أنظمة الملفات (الشبكية) لا تدعم WAL — نكمل بالوضع الافتراضي
+                pass
         try:
             os.chmod(path, 0o600)
         except OSError:
@@ -205,7 +214,6 @@ class Database:
 
     @staticmethod
     def _initialize_sqlite_schema(connection):
-        connection.execute("PRAGMA journal_mode=WAL")
         connection.executescript(SQLITE_SCHEMA)
         if not Database._sqlite_column_exists(connection, "assets", "is_recommended"):
             connection.execute(

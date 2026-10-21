@@ -22,7 +22,7 @@ from .admin import ServiceAdmin
 from .catalog_import import CatalogImportManager
 from .config import Settings
 from .db import Database
-from .errors import AudioMixerError, ForbiddenError, UnauthorizedError
+from .errors import AudioMixerError, ForbiddenError, NotFoundError, UnauthorizedError
 from .ffmpeg import FFmpeg
 from .service import AudioService
 
@@ -39,7 +39,6 @@ service = AudioService(db, ffmpeg, settings)
 
 @asynccontextmanager
 async def lifespan(_app):
-    service.fail_orphaned_memory_jobs()
     service.start_cleanup_worker()
     db.start_recovery_monitor()
     catalog_import.start_if_enabled()
@@ -479,6 +478,43 @@ def job(jid: str, _: object = Depends(require_jobs)):
 @router.get("/api/v1/audio/jobs/{jid}/status")
 def job_status(jid: str, _: object = Depends(require_jobs)):
     return service.job_status(jid)
+
+
+@router.get("/api/v1/audio/jobs/{jid}/events")
+async def job_events(jid: str, _: object = Depends(require_jobs)):
+    """بث SSE لحالة الوظيفة (v2-ultra) — يلغي تأخير الاستطلاع الدوري.
+
+    نفس بيانات /status تُدفع لحظة تغيّرها، مع حدث نهائي completed|failed
+    وإغلاق تلقائي. نقطة إضافية لا تكسر توافق API رجعياً؛ الاستطلاع يبقى صالحاً.
+    """
+    import asyncio as _asyncio
+    import json as _json
+
+    from fastapi.responses import StreamingResponse
+
+    async def _stream():
+        last_payload = None
+        for _ in range(3000):  # سقف أمان ~10 دقائق (200ms × 3000)
+            try:
+                status = service.job_status(jid)
+            except NotFoundError:
+                yield "event: error\ndata: {\"error\": \"job_not_found\"}\n\n"
+                return
+            payload = _json.dumps(status, ensure_ascii=False)
+            if payload != last_payload:
+                yield f"event: status\ndata: {payload}\n\n"
+                last_payload = payload
+                if status.get("status") in {"completed", "failed", "cancelled"}:
+                    yield f"event: done\ndata: {{\"status\": \"{status.get('status')}\"}}\n\n"
+                    return
+            await _asyncio.sleep(0.2)
+        yield "event: timeout\ndata: {\"error\": \"stream_timeout\"}\n\n"
+
+    return StreamingResponse(
+        _stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @router.get("/api/v1/audio/jobs/{jid}/result")
