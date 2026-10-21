@@ -18,6 +18,19 @@ logger = logging.getLogger(__name__)
 _generation_lock = threading.Lock()
 _generate_parameters = None
 
+
+async def _gather_cancel_on_error(awaitables):
+    tasks = [asyncio.create_task(awaitable) for awaitable in awaitables]
+    try:
+        return await asyncio.gather(*tasks)
+    except BaseException:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
 class VoiceCloneService:
     def _speaker_score(self, reference_path, generated_path):
         score, prediction = model_manager.speaker_verification.verify_files(
@@ -77,16 +90,36 @@ class VoiceCloneService:
 
     async def _generate_nano(self, target_text, prompt_text, reference_path, cfg,
                              seed, retry_badcase, retry_max_times,
-                             retry_ratio_threshold, reference_mode):
+                             retry_ratio_threshold, reference_mode,
+                             reference_latents=None):
+        semaphore = model_manager.nano_generation_semaphore
+        if semaphore is None:
+            return await self._generate_nano_unlocked(
+                target_text, prompt_text, reference_path, cfg, seed,
+                retry_badcase, retry_max_times, retry_ratio_threshold,
+                reference_mode, reference_latents,
+            )
+        async with semaphore:
+            return await self._generate_nano_unlocked(
+                target_text, prompt_text, reference_path, cfg, seed,
+                retry_badcase, retry_max_times, retry_ratio_threshold,
+                reference_mode, reference_latents,
+            )
+
+    async def _generate_nano_unlocked(self, target_text, prompt_text, reference_path, cfg,
+                                      seed, retry_badcase, retry_max_times,
+                                      retry_ratio_threshold, reference_mode,
+                                      reference_latents=None):
         if reference_mode not in {"hifi", "reference"}:
             raise ValueError("reference_mode must be hifi or reference")
-        reference_bytes = await asyncio.to_thread(reference_path.read_bytes)
-        latent_bytes = await model_manager.encode_reference_latents(reference_bytes)
+        if reference_latents is None:
+            reference_bytes = await asyncio.to_thread(reference_path.read_bytes)
+            reference_latents = await model_manager.encode_reference_latents(reference_bytes)
         kwargs = {
             "target_text": target_text,
-            "prompt_latents": latent_bytes if reference_mode == "hifi" else None,
+            "prompt_latents": reference_latents if reference_mode == "hifi" else None,
             "prompt_text": prompt_text or "",
-            "ref_audio_latents": latent_bytes,
+            "ref_audio_latents": reference_latents,
             "cfg_value": float(cfg),
         }
         # The upstream model caps generation at target_token_count * ratio + 10.
@@ -128,17 +161,42 @@ class VoiceCloneService:
         audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
         return normalize_peak(audio)
 
+    async def _generate_nano_candidate(
+        self, chunks, prompt_text, reference_path, cfg, candidate_seed,
+        retry_badcase, retry_max_times, retry_ratio_threshold,
+        reference_mode, reference_latents, sample_rate, silence_ms,
+    ):
+        segment_audio = await _gather_cancel_on_error(
+            self._generate_nano(
+                text, prompt_text, reference_path, cfg,
+                candidate_seed + segment_index, retry_badcase, retry_max_times,
+                retry_ratio_threshold, reference_mode, reference_latents,
+            )
+            for segment_index, text in enumerate(chunks)
+        )
+        return normalize_peak(concatenate_with_silence(segment_audio, sample_rate, silence_ms))
+
     async def clone(self, reference_audio, prompt_text, target_text, **options):
+        from pathlib import Path
+
+        temp_dir = Path(settings.TEMP_DIR)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        raw = temp_dir / f"{uuid.uuid4().hex}_raw"
+        clean = temp_dir / f"{uuid.uuid4().hex}_reference.wav"
+        try:
+            return await self._clone_impl(
+                reference_audio, prompt_text, target_text, raw, clean, **options
+            )
+        finally:
+            raw.unlink(missing_ok=True)
+            clean.unlink(missing_ok=True)
+
+    async def _clone_impl(self, reference_audio, prompt_text, target_text, raw, clean, **options):
         request_started = time.perf_counter()
         if not model_manager.ready:
             raise RuntimeError("AI models are not ready.")
 
-        reference_clean = settings.TEMP_DIR
-        import os
         from pathlib import Path
-        Path(reference_clean).mkdir(parents=True, exist_ok=True)
-        raw = Path(reference_clean) / f"{uuid.uuid4().hex}_raw"
-        clean = Path(reference_clean) / f"{uuid.uuid4().hex}_reference.wav"
         reference_bytes = await reference_audio.read(settings.max_file_size + 1)
         if not reference_bytes:
             raise ValueError("reference_audio is empty")
@@ -217,65 +275,136 @@ class VoiceCloneService:
         else:
             chunks = [target_text]
 
-        logger.info("Text chunks (%d): %s", len(chunks), chunks)
+        logger.info("Text chunks prepared count=%d lengths=%s", len(chunks), [len(x) for x in chunks])
 
         generation_started = time.perf_counter()
-        for index in range(count):
-            candidate_seed = base_seed + index * 1009
+        nano_reference_latents = None
+        parallel_nano_paths = None
+        if model_manager.tts_backend == "nanovllm":
+            reference_bytes = await asyncio.to_thread(clean.read_bytes)
+            nano_reference_latents = await model_manager.encode_reference_latents(reference_bytes)
+            if count > 1 or len(chunks) > 1:
+                retry_badcase = options.get("retry_badcase", settings.DEFAULT_RETRY_BADCASE)
+                retry_max_times = options.get("retry_max_times", settings.DEFAULT_RETRY_MAX_TIMES)
+                retry_ratio = options.get("retry_ratio_threshold", settings.DEFAULT_RETRY_RATIO_THRESHOLD)
+                parallel_nano_paths = {}
 
-            # Generate each segment independently, then join
-            segment_wavs = []
-            for seg_index, chunk in enumerate(chunks):
-                seg_seed = candidate_seed + seg_index
-                if model_manager.tts_backend == "nanovllm":
-                    wav_seg = await self._generate_nano(
-                        chunk,
+                async def generate_and_write_candidate(index):
+                    wav_candidate = await self._generate_nano_candidate(
+                        chunks,
                         prompt_text,
                         clean,
                         options.get("cfg_value", settings.DEFAULT_CFG),
-                        seg_seed,
-                        options.get("retry_badcase", settings.DEFAULT_RETRY_BADCASE),
-                        options.get("retry_max_times", settings.DEFAULT_RETRY_MAX_TIMES),
-                        options.get("retry_ratio_threshold", settings.DEFAULT_RETRY_RATIO_THRESHOLD),
+                        base_seed + index * 1009,
+                        retry_badcase,
+                        retry_max_times,
+                        retry_ratio,
                         reference_mode,
+                        nano_reference_latents,
+                        model_sr,
+                        silence_ms,
                     )
+                    candidate_path = Path(settings.TEMP_DIR) / f"{uuid.uuid4().hex}.wav"
+                    try:
+                        await asyncio.to_thread(
+                            sf.write, candidate_path, wav_candidate, model_sr, subtype="PCM_24"
+                        )
+                    except BaseException:
+                        candidate_path.unlink(missing_ok=True)
+                        raise
+                    return index, candidate_path, len(wav_candidate) / model_sr
+
+                candidate_tasks = [
+                    asyncio.create_task(generate_and_write_candidate(index))
+                    for index in range(count)
+                ]
+                try:
+                    for completed in asyncio.as_completed(candidate_tasks):
+                        index, candidate_path, duration = await completed
+                        parallel_nano_paths[index] = (candidate_path, duration)
+                except BaseException:
+                    for task in candidate_tasks:
+                        if not task.done():
+                            task.cancel()
+                    task_results = await asyncio.gather(*candidate_tasks, return_exceptions=True)
+                    for task_result in task_results:
+                        if isinstance(task_result, tuple) and len(task_result) == 3:
+                            task_result[1].unlink(missing_ok=True)
+                    for candidate_path, _duration in parallel_nano_paths.values():
+                        candidate_path.unlink(missing_ok=True)
+                    raise
+
+        try:
+            for index in range(count):
+                candidate_seed = base_seed + index * 1009
+
+                if parallel_nano_paths is not None:
+                    candidate_wav, candidate_duration = parallel_nano_paths[index]
                 else:
-                    def generate_segment():
-                        import torch
-                        with _generation_lock, torch.inference_mode():
-                            return self._generate_one(
-                                chunk, prompt_text, clean,
+                    segment_wavs = []
+                    for seg_index, chunk in enumerate(chunks):
+                        seg_seed = candidate_seed + seg_index
+                        if model_manager.tts_backend == "nanovllm":
+                            wav_seg = await self._generate_nano(
+                                chunk,
+                                prompt_text,
+                                clean,
                                 options.get("cfg_value", settings.DEFAULT_CFG),
-                                options.get("inference_timesteps", settings.DEFAULT_TIMESTEPS),
                                 seg_seed,
                                 options.get("retry_badcase", settings.DEFAULT_RETRY_BADCASE),
                                 options.get("retry_max_times", settings.DEFAULT_RETRY_MAX_TIMES),
                                 options.get("retry_ratio_threshold", settings.DEFAULT_RETRY_RATIO_THRESHOLD),
                                 reference_mode,
+                                nano_reference_latents,
                             )
-                    wav_seg = await asyncio.to_thread(generate_segment)
-                segment_wavs.append(wav_seg)
+                        else:
+                            def generate_segment():
+                                import torch
+                                with _generation_lock, torch.inference_mode():
+                                    return self._generate_one(
+                                        chunk, prompt_text, clean,
+                                        options.get("cfg_value", settings.DEFAULT_CFG),
+                                        options.get("inference_timesteps", settings.DEFAULT_TIMESTEPS),
+                                        seg_seed,
+                                        options.get("retry_badcase", settings.DEFAULT_RETRY_BADCASE),
+                                        options.get("retry_max_times", settings.DEFAULT_RETRY_MAX_TIMES),
+                                        options.get("retry_ratio_threshold", settings.DEFAULT_RETRY_RATIO_THRESHOLD),
+                                        reference_mode,
+                                    )
+                            wav_seg = await asyncio.to_thread(generate_segment)
+                        segment_wavs.append(wav_seg)
+                    wav = normalize_peak(concatenate_with_silence(segment_wavs, model_sr, silence_ms=silence_ms))
+                    candidate_wav = Path(settings.TEMP_DIR) / f"{uuid.uuid4().hex}.wav"
+                    await asyncio.to_thread(sf.write, candidate_wav, wav, model_sr, subtype="PCM_24")
+                    candidate_duration = len(wav) / model_sr
 
-            wav = concatenate_with_silence(segment_wavs, model_sr, silence_ms=silence_ms)
-            wav = normalize_peak(wav)
-            candidate_wav = Path(settings.TEMP_DIR) / f"{uuid.uuid4().hex}.wav"
-            await asyncio.to_thread(sf.write, candidate_wav, wav, model_sr, subtype="PCM_24")
-            callback = options.get("on_candidate_ready")
-            if callback is not None and count == 1:
-                # Launch mixing from lossless PCM before ECAPA scoring completes.
+                callback = options.get("on_candidate_ready")
+                if callback is not None and count == 1:
+                    # Launch mixing from lossless PCM before ECAPA scoring completes.
+                    try:
+                        early_mix_job_id = await callback(candidate_wav)
+                    except Exception:
+                        candidate_wav.unlink(missing_ok=True)
+                        raise
                 try:
-                    early_mix_job_id = await callback(candidate_wav)
-                except Exception:
+                    similarity = await asyncio.to_thread(self._speaker_score, clean, candidate_wav)
+                except BaseException:
                     candidate_wav.unlink(missing_ok=True)
                     raise
-            similarity = await asyncio.to_thread(self._speaker_score, clean, candidate_wav)
-            ranked.append({
-                "path": candidate_wav,
-                "score": similarity["score"],
-                "same_speaker": similarity["same_speaker"],
-                "seed": candidate_seed,
-                "duration": len(wav) / model_sr,
-            })
+                ranked.append({
+                    "path": candidate_wav,
+                    "score": similarity["score"],
+                    "same_speaker": similarity["same_speaker"],
+                    "seed": candidate_seed,
+                    "duration": candidate_duration,
+                })
+        except BaseException:
+            for candidate in ranked:
+                candidate["path"].unlink(missing_ok=True)
+            if parallel_nano_paths is not None:
+                for candidate_wav, _duration in parallel_nano_paths.values():
+                    candidate_wav.unlink(missing_ok=True)
+            raise
         logger.info("voice_stage request_id=%s stage=generation seconds=%.4f candidates=%d", raw.stem, time.perf_counter() - generation_started, count)
 
         best = max(ranked, key=lambda x: x["score"])

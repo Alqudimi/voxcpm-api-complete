@@ -32,8 +32,8 @@ def one_run(base: str, key: str, args: argparse.Namespace) -> tuple[float, float
         "target_text": args.target_text,
         "prompt_text": args.prompt_text,
         "cfg_value": "2.0",
-        "inference_timesteps": "30",
-        "candidates": "1",
+        "inference_timesteps": str(args.inference_timesteps),
+        "candidates": str(args.candidates),
         "retry_badcase": "true",
         "output_format": args.output_format,
     }
@@ -81,9 +81,18 @@ def main() -> None:
     parser.add_argument("--target-text", required=True)
     parser.add_argument("--runs", type=int, default=30)
     parser.add_argument("--warmups", type=int, default=2)
-    parser.add_argument("--poll-ms", type=int, default=200)
+    parser.add_argument("--candidates", type=int, choices=range(1, 9), default=1)
+    parser.add_argument(
+        "--inference-timesteps", type=int,
+        default=int(os.environ.get("DEFAULT_TIMESTEPS", "30")),
+    )
+    parser.add_argument("--poll-ms", type=int, default=50)
     parser.add_argument("--timeout", type=int, default=300)
-    parser.add_argument("--output-format", choices=["wav", "mp3", "ogg", "flac"], default="wav")
+    parser.add_argument(
+        "--output-format",
+        choices=["wav", "mp3", "ogg", "opus", "flac", "m4a", "aac", "webm"],
+        default="opus",
+    )
     args = parser.parse_args()
     base = os.environ.get("API_BASE", "http://127.0.0.1:8000")
     key = os.environ.get("API_KEY")

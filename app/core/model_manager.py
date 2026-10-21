@@ -21,6 +21,7 @@ class ModelManager:
         self.sample_rate = settings.OUTPUT_SAMPLE_RATE
         self.nano_max_num_seqs = None
         self.nano_gpu_memory_utilization = None
+        self.nano_generation_semaphore = None
         self.whisper = None
         self.whisper_backend = settings.WHISPER_BACKEND.lower()
         self.speaker_verification = None
@@ -59,6 +60,7 @@ class ModelManager:
             memory_utilization = settings.NANO_GPU_MEMORY_UTILIZATION or min(auto_util, safe_fraction)
             self.nano_max_num_seqs = max_seqs
             self.nano_gpu_memory_utilization = memory_utilization
+            self.nano_generation_semaphore = asyncio.Semaphore(max_seqs)
             try:
                 from nanovllm_voxcpm import VoxCPM as NanoVoxCPM
             except ImportError as exc:
@@ -195,6 +197,7 @@ class ModelManager:
         self.whisper = None
         self.speaker_verification = None
         self._reference_latent_cache.clear()
+        self.nano_generation_semaphore = None
         self.ready = False
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
