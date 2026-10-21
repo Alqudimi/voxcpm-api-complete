@@ -1,0 +1,3 @@
+# Linux/NVIDIA GPU inference engine recommended for VoxCPM2.
+# Requires a supported CUDA/PyTorch runtime and FlashAttention-compatible environment.
+nano-vllm-voxcpm

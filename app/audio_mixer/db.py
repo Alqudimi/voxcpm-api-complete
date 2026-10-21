@@ -196,6 +196,7 @@ class Database:
         connection = sqlite3.connect(path, timeout=30, isolation_level=None)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
+        connection.execute("PRAGMA synchronous=NORMAL")
         try:
             os.chmod(path, 0o600)
         except OSError:
@@ -204,6 +205,7 @@ class Database:
 
     @staticmethod
     def _initialize_sqlite_schema(connection):
+        connection.execute("PRAGMA journal_mode=WAL")
         connection.executescript(SQLITE_SCHEMA)
         if not Database._sqlite_column_exists(connection, "assets", "is_recommended"):
             connection.execute(

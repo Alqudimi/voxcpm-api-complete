@@ -1,10 +1,13 @@
 import os
 import re
+import logging
 import subprocess
 from pathlib import Path
 import librosa
 import numpy as np
 import soundfile as sf
+
+logger = logging.getLogger(__name__)
 
 def ffmpeg_path():
     path = shutil_which("ffmpeg")
@@ -29,7 +32,20 @@ def normalize_peak(audio, peak=0.97):
     return audio
 
 def prepare_reference(input_path, output_path, target_sr=16000, top_db=35):
-    audio, _ = librosa.load(str(input_path), sr=target_sr, mono=True)
+    audio, source_sr = sf.read(str(input_path), dtype="float32", always_2d=False)
+    if getattr(audio, "ndim", 1) > 1:
+        audio = np.mean(audio, axis=1, dtype=np.float32)
+    if int(source_sr) != int(target_sr):
+        resampler = os.getenv("AUDIO_RESAMPLER", "soxr_hq").lower()
+        if resampler == "soxr_hq":
+            try:
+                import soxr
+                audio = soxr.resample(audio, source_sr, target_sr, quality="HQ")
+            except ImportError:
+                logger.warning("AUDIO_RESAMPLER=soxr_hq requested but soxr is unavailable; using librosa")
+                audio = librosa.resample(audio, orig_sr=source_sr, target_sr=target_sr)
+        else:
+            audio = librosa.resample(audio, orig_sr=source_sr, target_sr=target_sr)
     audio = np.asarray(audio, dtype=np.float32)
     if len(audio) == 0:
         raise ValueError("The reference audio is empty.")
@@ -48,9 +64,13 @@ def prepare_reference(input_path, output_path, target_sr=16000, top_db=35):
         "samples": len(trimmed),
     }
 
-def reference_quality_report(path):
-    duration = audio_duration(path)
-    audio, sr = librosa.load(str(path), sr=None, mono=True)
+def reference_quality_report(path, audio=None, sr=None):
+    if audio is None or sr is None:
+        audio, sr = sf.read(str(path), dtype="float32", always_2d=False)
+        if getattr(audio, "ndim", 1) > 1:
+            audio = np.mean(audio, axis=1, dtype=np.float32)
+    audio = np.asarray(audio, dtype=np.float32)
+    duration = len(audio) / float(sr) if sr else audio_duration(path)
     rms = float(np.sqrt(np.mean(audio ** 2)))
     peak = float(np.max(np.abs(audio)))
     clipping_ratio = float(np.mean(np.abs(audio) >= 0.999))
@@ -143,6 +163,48 @@ def split_text_at_question_marks(text):
     text = re.sub(r"\s+", " ", str(text).strip())
     parts = re.split(r"(?<=\u061f)\s*", text)
     return [p.strip() for p in parts if p.strip()]
+
+
+def split_text_for_generation(text, max_chars=350):
+    """Pack sentence-aware chunks under a safe model-context size."""
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not text:
+        return []
+    max_chars = max(64, int(max_chars))
+    sentences = re.split(r"(?<=[.!?؟؛。])\s+", text)
+    chunks, current = [], ""
+    for sentence in sentences:
+        if len(sentence) > max_chars:
+            words = sentence.split(" ")
+            pieces, piece = [], ""
+            for word in words:
+                if len(word) > max_chars:
+                    if piece:
+                        pieces.append(piece)
+                        piece = ""
+                    pieces.extend(word[i:i + max_chars] for i in range(0, len(word), max_chars))
+                elif not piece:
+                    piece = word
+                elif len(piece) + len(word) + 1 <= max_chars:
+                    piece = f"{piece} {word}"
+                else:
+                    pieces.append(piece)
+                    piece = word
+            if piece:
+                pieces.append(piece)
+        else:
+            pieces = [sentence]
+        for piece in pieces:
+            if not current:
+                current = piece
+            elif len(current) + len(piece) + 1 <= max_chars:
+                current = f"{current} {piece}"
+            else:
+                chunks.append(current)
+                current = piece
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 def concatenate_with_silence(wav_list, sample_rate, silence_ms=350):

@@ -1,0 +1,5 @@
+# Optional speed/runtime extras. Install separately after validating platform wheels and quality.
+faster-whisper>=1.1,<2
+soxr>=0.5
+orjson>=3.10
+uvloop>=0.21; platform_system != "Windows"

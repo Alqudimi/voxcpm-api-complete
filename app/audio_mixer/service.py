@@ -35,9 +35,18 @@ class AudioService:
             return default
         return self.admin_config.get(service_name, key)
 
+    def queue_capacity_available(self):
+        """Best-effort non-blocking backpressure check for expensive API work."""
+        if not self.executor.acquire(blocking=False):
+            return False
+        self.executor.release()
+        return True
+
     def resolve_output_format(self, output_format=None):
         return self.ffmpeg.normalize_output_format(
-            output_format or self._setting("ffmpeg", "default_output_format", "wav")
+            output_format or self._setting(
+                "ffmpeg", "default_output_format", self.settings.default_output_format
+            )
         )
 
     def cleanup_worker_status(self):
@@ -101,6 +110,25 @@ class AudioService:
 
     def stop_cleanup_worker(self):
         self._cleanup_stop.set()
+
+    def fail_orphaned_memory_jobs(self):
+        """Mark volatile-input jobs from a previous process as unrecoverable."""
+        if not self.settings.memory_job_inputs:
+            return 0
+        with self.db.connect() as connection:
+            cursor = connection.execute(
+                "UPDATE jobs SET status=?,failed_at=?,error_code=?,error_message=? "
+                "WHERE status IN (?,?) AND configuration_json LIKE ?",
+                (
+                    "failed", now(), "worker_restarted",
+                    "Volatile job inputs were lost when the service process restarted",
+                    "queued", "processing", '%"storage": "worker_memory"%',
+                ),
+            )
+        count = max(0, int(getattr(cursor, "rowcount", 0)))
+        if count:
+            logger.warning("Marked %d orphaned worker_memory jobs as failed", count)
+        return count
 
     def _temp_file(self, data, suffix=".audio"):
         with NamedTemporaryFile(
@@ -311,6 +339,7 @@ class AudioService:
         variation_seed=None,
         output_format="wav",
         noise_metadata=None,
+        persist_inputs=True,
     ):
         output_format = self.resolve_output_format(output_format)
         if not -60 <= source_gain <= 6 or not -60 <= noise_gain <= 6:
@@ -321,7 +350,7 @@ class AudioService:
             "noise_gain_db": noise_gain,
             "noise_extension_seconds": self._setting("jobs", "noise_extension_seconds", self.settings.min_noise_margin_seconds),
             "pipeline_version": "2.0.0",
-            "storage": "postgresql_bytea",
+            "storage": "postgresql_bytea" if persist_inputs else "worker_memory",
             "variation_seed": variation_seed
             if variation_seed is not None
             else secrets.randbits(64),
@@ -347,12 +376,16 @@ class AudioService:
                     f"db://jobs/{jid}/output",
                     "{}",
                     None,
-                    source_bytes,
-                    noise_bytes,
+                    source_bytes if persist_inputs else None,
+                    noise_bytes if persist_inputs else None,
                     None,
                 ),
             )
-        threading.Thread(target=self._run, args=(jid,), daemon=True).start()
+        threading.Thread(
+            target=self._run,
+            args=(jid, None if persist_inputs else source_bytes, None if persist_inputs else noise_bytes),
+            daemon=True,
+        ).start()
         return jid
 
     def submit_mix(
@@ -492,7 +525,7 @@ class AudioService:
             noise_gain,
         )
 
-    def _run(self, jid):
+    def _run(self, jid, source_bytes=None, noise_bytes=None):
         if not self.executor.acquire(timeout=1):
             with self.db.connect() as c:
                 c.execute(
@@ -501,6 +534,7 @@ class AudioService:
                 )
             return
         started = time.time()
+        logger.info("audio_job_stage job_id=%s stage=mix_started", jid)
         source = noise = output = None
         try:
             with self.db.connect() as c:
@@ -513,10 +547,14 @@ class AudioService:
                     ("processing", now(), jid),
                 )
             configuration = json.loads(row["configuration_json"] or "{}")
-            source = self._temp_file(bytes(row["source_audio"]), Path(row["source_reference"] or "source.audio").suffix or ".source")
+            source_payload = source_bytes if source_bytes is not None else row["source_audio"]
+            noise_payload = noise_bytes if noise_bytes is not None else row["noise_audio"]
+            if source_payload is None:
+                raise ValidationError("Job input payload is unavailable after process restart")
+            source = self._temp_file(bytes(source_payload), Path(row["source_reference"] or "source.audio").suffix or ".source")
             noise = (
-                self._temp_file(bytes(row["noise_audio"]), Path(row["noise_reference"] or "noise.audio").suffix or ".noise")
-                if row["noise_audio"] is not None
+                self._temp_file(bytes(noise_payload), Path(row["noise_reference"] or "noise.audio").suffix or ".noise")
+                if noise_payload is not None
                 else None
             )
             source_meta = self._validate_input_duration(source)
@@ -569,6 +607,7 @@ class AudioService:
                         jid,
                     ),
                 )
+            logger.info("audio_job_stage job_id=%s stage=mix_completed seconds=%.4f", jid, time.time() - started)
         except Exception as exc:
             try:
                 with self.db.connect() as c:
