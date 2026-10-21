@@ -4,13 +4,13 @@
 
 ## المبدأ
 
-يتم تحميل محرك VoxCPM2 وECAPA عند Startup؛ Whisper يُحمّل كسولاً فقط عند طلب النسخ:
+يتم تحميل النماذج الثلاثة عند Startup:
 
 1. VoxCPM2
-2. ECAPA speaker verification
-3. Whisper large-v3 عند الحاجة فقط
+2. Whisper large-v3
+3. ECAPA speaker verification
 
-لا يحدث تحميل لـVoxCPM2 أو ECAPA عند أول طلب. قد يحمّل أول طلب نسخ Whisper إذا لم يكن محمّلاً مسبقاً.
+وبالتالي لا يحدث تحميل للنماذج عند أول طلب.
 
 ## الهيكل
 
@@ -84,29 +84,20 @@ Multipart:
 
 ```bash
 cp .env.example .env
-# المثبت ينشئ API_KEY عشوائياً إذا بقي placeholder؛ يتطلب Linux وNVIDIA وPython 3.10–3.12:
+# عدّل API_KEY، ثم نفّذ في Linux مع NVIDIA GPU وPython 3.10–3.12:
 bash scripts/install_gpu.sh
 source .venv/bin/activate
 scripts/start_gpu.sh
 ```
 
-أو عبر Docker Compose (يتطلب NVIDIA Container Toolkit):
-
-```bash
-cp .env.example .env
-python3 scripts/prepare_env.py
-# سيُنشأ مفتاح API عشوائي داخل .env دون طباعته:
-docker compose up --build
-```
-
-يثبت السكربت PyTorch 2.8.0 بعجلات CUDA 12.8 وNanoVLLM/FlashAttention وملحقات الأداء، ثم يتحقق من GPU. أول تشغيل ينزّل أوزان VoxCPM2 ويجري الإحماء. يستخدم NanoVLLM افتراضياً؛ للعودة إلى المحرك القياسي ضع `TTS_ENGINE=pytorch` في `.env`. يبدأ `start_gpu.sh` بعامل Uvicorn واحد، ويتولى محرك NanoVLLM التزامن.
+يثبت السكربت PyTorch 2.8.0 بعجلات CUDA 12.8 ثم اعتمادات المشروع ويتحقق من GPU. أول تشغيل ينزّل أوزان VoxCPM2 والنماذج المساعدة ويجري إحماءً للنموذج. يبدأ `start_gpu.sh` بعامل Uvicorn واحد، كي لا تُحمّل نسخة GPU كاملة لكل عامل.
 
 Swagger:
 `http://SERVER:8000/docs`
 
 ## ملاحظة
 
-يدعم التطبيق محرك NanoVLLM المتدفق ومحرك VoxCPM PyTorch كخطة رجوع. في مسار PyTorch حُفظت معاملات `model.generate()`، وفي NanoVLLM تُمرر إعدادات المرجع والنص وCFG والبذرة مع سقف طول وإعادة محاولة للحالات الشاذة، بما في ذلك:
+تم فصل طبقة VoxCPM2 عن FastAPI. منطق `model.generate()` الموجود في Notebook المستخدم تم الحفاظ عليه، بما في ذلك:
 - prompt_wav_path
 - prompt_text
 - reference_wav_path
@@ -116,18 +107,18 @@ Swagger:
 - Best-of-N
 - seed compatibility
 - ECAPA speaker scoring
-- تقطيع النص الطويل عند علامات الاستفهام العربية فقط عند تفعيل الخيار
+- إرسال النص كاملاً بدون Smart Chunking
 
 كما تم دمج Whisper وFFmpeg في الخدمات المنفصلة.
 
 
 ## تفاصيل تشغيل Clone and Mix
 
-يقبل `POST /api/v1/voice/clone-and-mix` طلب `multipart/form-data` ومصادقة `X-API-Key`، ويعيد `202 Accepted` مع `job_id` وروابط الحالة والأحداث والنتيجة بعد اكتمال التوليد. يتابع SSE حالة مرحلة الخلط؛ لا يرسل مقاطع الصوت إلى العميل. استخدم `events_url` مع `fetch` وترويسة `X-API-Key`، أو `status_url` للتوافق، ثم نزّل النتيجة عبر `result_url`.
+يقبل `POST /api/v1/voice/clone-and-mix` طلب `multipart/form-data` ومصادقة `X-API-Key`، ويعيد `202 Accepted` مع `job_id` وروابط الحالة والنتيجة. تتوفر متابعة المهمة عبر `GET /api/v1/audio/jobs/{job_id}/status` وتنزيلها عبر `GET /api/v1/audio/jobs/{job_id}/result`.
 
-تم ضبط `candidates` فعلياً (من 1 إلى 8) لاختيار المرشح الأعلى في تشابه المتحدث. في NanoVLLM تُجدول المرشحات والمقاطع المستقلة بالتوازي، مع حد عالمي لتدفقات GPU النشطة يطابق `max_num_seqs` وإعادة كل موجة مكتملة إلى ملف مؤقت لتقليل RAM؛ لا يتغير عدد الخطوات أو CFG أو حارس الجودة. يجري المسار فحص حدود النص وصلاحية صيغة الإخراج ومجال الكسب وسعة طابور الخلط قبل تشغيله. الصيغة الافتراضية Opus عند 128 kbps؛ وتبقى الصيغ الأخرى قابلة للاختيار. تستخدم الملفات المؤقتة tmpfs عند توفر مساحة كافية، وإلا يعود التطبيق تلقائياً إلى القرص.
+تم ضبط `candidates` فعلياً (من 1 إلى 8) لاختيار المرشح الأعلى في تشابه المتحدث. يجري المسار فحص حجم/وجود الضوضاء، صلاحية صيغة الإخراج، ومجال الكسب من -60 إلى +6 dB قبل تشغيل التوليد. الصيغة الافتراضية WAV ما لم يُحدد خلاف ذلك. ملفات المرشحين المؤقتة وملف الكلام الوسيط تزال بعد الاستخدام.
 
-استخدم `.env.example` كقالب؛ ينشئ `scripts/prepare_env.py` مفتاح API عشوائياً خاصاً تلقائياً عند بقاء placeholder. وضع `REFERENCE_MODE=auto` يستخدم hi-fi cloning عند إرسال النص المرجعي، وإلا يستخدم المرجع الصوتي مباشرة لتجاوز Whisper. اختبر المخرجات على أصواتك قبل اعتماد هذا الوضع إنتاجياً.
+استخدم `.env.example` كقالب، واستبدل مفتاح API قبل التشغيل. وضع `REFERENCE_MODE=auto` يستخدم hi-fi cloning عند إرسال النص المرجعي، وإلا يستخدم المرجع الصوتي مباشرة لتجاوز Whisper. اختبر المخرجات على أصواتك قبل اعتماد هذا الوضع إنتاجياً.
 
 
 لتفاصيل التحسينات وخيارات التشغيل والقياس راجع [PERFORMANCE_IMPLEMENTATION_AR.md](PERFORMANCE_IMPLEMENTATION_AR.md). فحص الجهاز عبر `scripts/preflight_gpu.py` والقياس الطرفي عبر `scripts/benchmark_clone_and_mix.py`.

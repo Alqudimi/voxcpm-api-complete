@@ -1,4 +1,3 @@
-import asyncio
 import json
 import math
 import os
@@ -14,10 +13,9 @@ from fastapi import (
     Header,
     HTTPException,
     Query,
-    Request,
     UploadFile,
 )
-from fastapi.responses import JSONResponse, Response, StreamingResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
 from .admin import ServiceAdmin
@@ -32,7 +30,7 @@ settings = Settings.from_env()
 settings.prepare()
 fallback_database_path = os.getenv(
     "AUDIO_MIXER_FALLBACK_SQLITE_PATH",
-    str(settings.storage_path / "database-fallback" / "audio_mixer_fallback.sqlite3"),
+    str(settings.temp_path / "database-fallback" / "audio_mixer_fallback.sqlite3"),
 )
 db = Database(settings.database_url, fallback_path=fallback_database_path)
 ffmpeg = FFmpeg(settings.ffmpeg_path, settings.ffprobe_path)
@@ -481,40 +479,6 @@ def job(jid: str, _: object = Depends(require_jobs)):
 @router.get("/api/v1/audio/jobs/{jid}/status")
 def job_status(jid: str, _: object = Depends(require_jobs)):
     return service.job_status(jid)
-
-
-@router.get("/api/v1/audio/jobs/{jid}/events")
-async def job_events(jid: str, request: Request, _: object = Depends(require_jobs)):
-    if os.getenv("SSE_PROGRESS", "true").strip().lower() not in {"1", "true", "yes", "on"}:
-        raise HTTPException(status_code=404, detail="SSE progress is disabled")
-    await asyncio.to_thread(service.job_status, jid)
-
-    async def events():
-        previous = None
-        while not await request.is_disconnected():
-            status = await asyncio.to_thread(service.job_status, jid)
-            payload = json.dumps(status, separators=(",", ":"))
-            if payload != previous:
-                yield f"event: status\ndata: {payload}\n\n"
-                previous = payload
-            if status["status"] in {"completed", "failed", "cancelled"}:
-                if status["status"] == "completed":
-                    done = {
-                        "status": "completed",
-                        "result_url": f"{str(request.base_url).rstrip('/')}/api/v1/audio/jobs/{jid}/result",
-                    }
-                    yield f"event: done\ndata: {json.dumps(done, separators=(',', ':'))}\n\n"
-                else:
-                    yield f"event: done\ndata: {payload}\n\n"
-                return
-            yield ": keep-alive\n\n"
-            await asyncio.sleep(0.25)
-
-    return StreamingResponse(
-        events(),
-        media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
 
 
 @router.get("/api/v1/audio/jobs/{jid}/result")

@@ -20,10 +20,7 @@ OUTPUT_FORMATS = {
     "opus": {
         "suffix": ".opus",
         "media_type": "audio/ogg",
-        "codec_args": [
-            "-c:a", "libopus", "-b:a", "128k", "-vbr", "on",
-            "-application", "audio", "-compression_level", "4", "-f", "opus",
-        ],
+        "codec_args": ["-c:a", "libopus", "-b:a", "128k", "-vbr", "on", "-f", "opus"],
     },
     "mp3": {
         "suffix": ".mp3",

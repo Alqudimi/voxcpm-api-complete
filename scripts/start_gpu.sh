@@ -8,6 +8,5 @@ if [[ ! -x "$VENV_DIR/bin/python" ]]; then
 fi
 # shellcheck disable=SC1090
 source "$VENV_DIR/bin/activate"
-python scripts/prepare_env.py
 python scripts/preflight_gpu.py
 exec python -m uvicorn app.main:app --host "${HOST:-0.0.0.0}" --port "${PORT:-8000}" --workers 1 --loop auto

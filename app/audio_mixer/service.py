@@ -35,18 +35,9 @@ class AudioService:
             return default
         return self.admin_config.get(service_name, key)
 
-    def queue_capacity_available(self):
-        """Best-effort non-blocking backpressure check for expensive API work."""
-        if not self.executor.acquire(blocking=False):
-            return False
-        self.executor.release()
-        return True
-
     def resolve_output_format(self, output_format=None):
         return self.ffmpeg.normalize_output_format(
-            output_format or self._setting(
-                "ffmpeg", "default_output_format", self.settings.default_output_format
-            )
+            output_format or self._setting("ffmpeg", "default_output_format", "wav")
         )
 
     def cleanup_worker_status(self):

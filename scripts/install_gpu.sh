@@ -8,7 +8,6 @@ if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
   echo "Python was not found: $PYTHON_BIN" >&2
   exit 2
 fi
-"$PYTHON_BIN" scripts/prepare_env.py
 "$PYTHON_BIN" - <<'PY'
 import sys
 if not ((3, 10) <= sys.version_info[:2] < (3, 13)):
@@ -27,20 +26,11 @@ if [[ ! -x "$VENV_DIR/bin/python" ]]; then
 fi
 # shellcheck disable=SC1090
 source "$VENV_DIR/bin/activate"
-python -m pip install --upgrade pip wheel packaging ninja
+python -m pip install --upgrade pip
 # CUDA 12.8 wheels support current NVIDIA cards; the host still needs a compatible driver.
 python -m pip install --index-url https://download.pytorch.org/whl/cu128 \
   torch==2.8.0 torchaudio==2.8.0
 python -m pip install -r requirements.txt
-python -m pip install -r requirements-performance.txt
-if [[ "${INSTALL_NANOVLLM:-1}" == "1" ]]; then
-  if ! python -m pip install -r requirements-gpu.txt; then
-    echo "NanoVLLM/FlashAttention install failed. Install a compatible CUDA Toolkit/build toolchain or set TTS_ENGINE=pytorch and rerun with INSTALL_NANOVLLM=0." >&2
-    exit 2
-  fi
-else
-  echo "NanoVLLM installation was skipped. Set TTS_ENGINE=pytorch in .env before startup."
-fi
 python scripts/preflight_gpu.py
 cat <<'EOF'
 GPU environment is installed and preflight passed.

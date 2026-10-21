@@ -1,20 +1,17 @@
 import os
-import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
 
-@dataclass
+@dataclass(frozen=True)
 class Settings:
     host: str = "0.0.0.0"
     port: int = 10000
     database_url: str = "sqlite:///./audio_mixer.db"
     storage_path: Path = Path("./storage")
     temp_path: Path = Path("./storage/temp")
-    temp_fallback_path: Path = Path("./storage/temp")
     ffmpeg_path: str = "ffmpeg"
     ffprobe_path: str = "ffprobe"
-    default_output_format: str = "opus"
     max_upload_size: int = 256 * 1024 * 1024
     max_audio_duration: float = 1800.0
     max_concurrent_jobs: int = 2
@@ -40,10 +37,8 @@ class Settings:
             ),
             storage_path=Path(os.getenv("AUDIO_MIXER_STORAGE_PATH", "./storage")),
             temp_path=Path(os.getenv("AUDIO_MIXER_TEMP_PATH", "./storage/temp")),
-            temp_fallback_path=Path(os.getenv("AUDIO_TMPFS_FALLBACK_DIR", "./storage/temp")),
             ffmpeg_path=os.getenv("AUDIO_MIXER_FFMPEG_PATH", "ffmpeg"),
             ffprobe_path=os.getenv("AUDIO_MIXER_FFPROBE_PATH", "ffprobe"),
-            default_output_format=os.getenv("AUDIO_MIXER_DEFAULT_OUTPUT_FORMAT", "opus"),
             max_upload_size=int(
                 os.getenv("AUDIO_MIXER_MAX_UPLOAD_SIZE", str(256 * 1024 * 1024))
             ),
@@ -73,12 +68,4 @@ class Settings:
         )
 
     def prepare(self) -> None:
-        if str(self.temp_path).startswith("/dev/shm"):
-            try:
-                self.temp_path.mkdir(parents=True, exist_ok=True)
-                if shutil.disk_usage(self.temp_path).free < 256 * 1024**2:
-                    self.temp_path = self.temp_fallback_path
-            except OSError:
-                self.temp_path = self.temp_fallback_path
-        self.storage_path.mkdir(parents=True, exist_ok=True)
         self.temp_path.mkdir(parents=True, exist_ok=True)

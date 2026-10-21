@@ -3,7 +3,6 @@ uvicorn[standard]>=0.34
 python-multipart>=0.0.20
 pydantic>=2.10
 pydantic-settings>=2.7
-python-dotenv>=1.0
 numpy>=1.26
 scipy
 soundfile

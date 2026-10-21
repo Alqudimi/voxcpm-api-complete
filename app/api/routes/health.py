@@ -18,13 +18,10 @@ async def health():
         }
     dtype = None
     if model_manager.voxcpm is not None:
-        if model_manager.tts_backend == "nanovllm":
-            dtype = "engine-managed"
-        else:
-            try:
-                dtype = str(next(model_manager.voxcpm.tts_model.parameters()).dtype)
-            except (AttributeError, StopIteration, TypeError):
-                dtype = "unknown"
+        try:
+            dtype = str(next(model_manager.voxcpm.tts_model.parameters()).dtype)
+        except (AttributeError, StopIteration, TypeError):
+            dtype = "unknown"
     return {
         "success": True,
         "status": "healthy" if model_manager.ready else "starting",
@@ -38,10 +35,6 @@ async def health():
             "gpu": gpu,
             "voxcpm_dtype": dtype,
             "whisper_backend": model_manager.whisper_backend,
-            "tts_backend": model_manager.tts_backend,
-            "tts_sample_rate": model_manager.sample_rate,
-            "nano_max_num_seqs": model_manager.nano_max_num_seqs,
-            "nano_gpu_memory_utilization": model_manager.nano_gpu_memory_utilization,
         },
     }
 

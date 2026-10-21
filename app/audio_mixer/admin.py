@@ -35,7 +35,7 @@ class ServiceAdmin:
         }
         self._defaults = {
             "database": {"error_limit": 20},
-            "ffmpeg": {"default_output_format": audio_service.settings.default_output_format},
+            "ffmpeg": {"default_output_format": "wav"},
             "jobs": {
                 "max_upload_size_bytes": audio_service.settings.max_upload_size,
                 "max_audio_duration_seconds": int(audio_service.settings.max_audio_duration),
