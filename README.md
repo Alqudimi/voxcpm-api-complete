@@ -73,6 +73,14 @@ Multipart:
 `GET /api/v1/voice/audio/{filename}`
 `GET /api/v1/audio/output/{filename}`
 
+### Platform Resources & Sync
+(انظر التوثيق الكامل في [PLATFORM_SYNC_INTEGRATION.md](PLATFORM_SYNC_INTEGRATION.md))
+- `GET /api/v1/resources/summary`: إحصائيات الموارد المخزنة محلياً في SQLite وحالة المنصة.
+- `GET /api/v1/resources/voices`: استعراض كافة الأصوات وعيناتها المخزنة محلياً.
+- `GET /api/v1/resources/noise`: استعراض كافة ملفات وعينات الضوضاء المخزنة محلياً.
+- `POST /api/v1/resources/sync`: تشغيل المزامنة وإعادة فحص الملفات يدوياً.
+- `POST /api/v1/resources/register-server`: إعادة إرسال دومين الخادم ومفتاح API للمنصة يدوياً.
+
 ## Authentication
 
 أرسل:

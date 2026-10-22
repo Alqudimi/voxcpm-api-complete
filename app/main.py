@@ -7,7 +7,7 @@ if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
 
 from fastapi import FastAPI
 
-from app.api.routes import audio, health, transcription, voice
+from app.api.routes import audio, health, resources, transcription, voice
 from app.audio_mixer.api import include_audio_mixer
 from app.core.config import settings
 from app.core.lifecycle import lifespan
@@ -32,3 +32,4 @@ app.include_router(health.router, prefix="/api/v1")
 app.include_router(voice.router, prefix="/api/v1")
 app.include_router(transcription.router, prefix="/api/v1")
 app.include_router(audio.router, prefix="/api/v1")
+app.include_router(resources.router, prefix="/api/v1")

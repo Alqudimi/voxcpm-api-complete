@@ -1,5 +1,6 @@
 from pathlib import Path
 from pydantic_settings import BaseSettings, SettingsConfigDict
+import os
 
 def _env_bool(value: str, default: bool) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "on"} if value is not None else default
@@ -37,6 +38,16 @@ class Settings(BaseSettings):
     UPLOAD_DIR: str = "storage/uploads"
     OUTPUT_DIR: str = "storage/outputs"
     TEMP_DIR: str = "storage/temp"
+
+    # ─── إعدادات منصة استنساخ الصوت ومزامنة الموارد الخارجية ───
+    PLATFORM_BASE_URL: str = os.getenv("AUDIO_MIXER_HOST", "http://127.0.0.1:8000"),                # رابط المنصة الخارجية الرئيسي (مثال: http://localhost:8000)
+    SERVER_PUBLIC_URL: str = ""                # رابط الخادم الحالي لإرساله للمنصة (يحسب تلقائياً إن ترك فارغاً)
+    PLATFORM_SYNC_ON_STARTUP: bool = True      # تحميل وتخزين أصوات العينات والضوضاء عند الإقلاع
+    PLATFORM_REGISTER_ON_STARTUP: bool = True  # إرسال الدومين ومفتاح API للمنصة عند الإقلاع
+    PLATFORM_TIMEOUT: int = 600                # مهلة الاتصال بالثواني
+    PLATFORM_DB_PATH: str = "storage/platform_resources.db"
+    VOICE_SAMPLES_DIR: str = "storage/voice_samples"
+    NOISE_SAMPLES_DIR: str = "storage/noise_samples"
 
     # ─── طبقة الأداء v3-max — المضبوط التلقائي: كل متغير يقبل "auto" ───
     # القيمة "auto" (أو 0 للأعداد) = AutoTuner يحسبها من عتادك ويعيّنها.
@@ -315,6 +326,8 @@ class Settings(BaseSettings):
             self.OUTPUT_DIR,
             self.TEMP_DIR,
             self.ECAPA_SAVEDIR,
+            self.VOICE_SAMPLES_DIR,
+            self.NOISE_SAMPLES_DIR,
         ):
             Path(item).mkdir(parents=True, exist_ok=True)
         # المجلد الوسيط السريع يُنشأ هنا أيضاً (فشله غير قاتل)

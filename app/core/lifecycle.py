@@ -21,6 +21,18 @@ async def lifespan(app: FastAPI):
         import logging
 
         logging.getLogger(__name__).warning("ensure_engine_loaded fallback: %s", exc)
+
+    # مزامنة المنصة الخارجية: تسجيل إعدادات الخادم + تحميل وحفظ العينات والضوضاء في SQLite
+    try:
+        import asyncio
+        from app.services.platform.platform_sync_service import platform_sync_service
+
+        asyncio.create_task(platform_sync_service.run_startup_workflow())
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).warning("platform_sync_service startup failed: %s", exc)
+
     yield
     await model_manager.unload_all()
     reset_engine()
