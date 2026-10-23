@@ -2,6 +2,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import shutil
 import urllib.error
 import urllib.parse
@@ -39,30 +40,94 @@ class PlatformSyncService:
             logger.warning("تعذر تسخين كاش الذاكرة السريعة في __init__: %s", exc)
 
     def detect_server_url(self) -> str:
-        """اكتشاف رابط الخادم العام الذي يعمل منه التطبيق تلقائياً وبأعلى دقة."""
-        # 1. إعداد صريح في الإعدادات أو متغيرات البيئة
-        explicit_url = (
-            getattr(settings, "SERVER_PUBLIC_URL", "")
-            or os.getenv("SERVER_PUBLIC_URL")
-            or os.getenv("PUBLIC_URL")
-            or os.getenv("SERVER_URL")
-            or os.getenv("APP_URL")
-        )
-        if explicit_url and str(explicit_url).strip():
-            return str(explicit_url).strip().rstrip("/")
+        """اكتشاف رابط الخادم العام الذي يعمل منه التطبيق تلقائياً وبأعلى دقة:
+        1. الإعدادات الصريحة في .env أو متغيرات البيئة (مثل SERVER_PUBLIC_URL).
+        2. بيئة RunPod السحابية (https://{RUNPOD_POD_ID}-{PORT}.proxy.runpod.net).
+        3. بيئة Google Colab عبر نفق Cloudflare Tunnel (فحص /content/cloudflared.log واستخراج رابط trycloudflare.com).
+        4. ملفات مؤشرات الأنفاق (مثل /content/tunnel_url.txt).
+        5. خدمة ngrok المحلية إن وُجدت.
+        6. الرابط الافتراضي المحلي (http://localhost:8000).
+        """
+        # 1. فحص المتغيرات البيئية ذات الأولوية الصريحة (إذا لم تكن localhost)
+        for env_key in [
+            "SERVER_PUBLIC_URL",
+            "PUBLIC_URL",
+            "TUNNEL_URL",
+            "CLOUDFLARE_URL",
+            "SERVER_URL",
+            "APP_URL",
+        ]:
+            val = getattr(settings, env_key, None) or os.getenv(env_key)
+            if val and str(val).strip():
+                clean = str(val).strip().rstrip("/")
+                if "localhost" not in clean and "127.0.0.1" not in clean:
+                    return clean
 
         # 2. بيئة RunPod السحابية (معرّف Pod)
         pod_id = os.getenv("RUNPOD_POD_ID")
-        if pod_id:
-            # منفذ 8000 الافتراضي لخدمة VoxCPM على بروكسي RunPod
-            return f"https://{pod_id.strip()}-8000.proxy.runpod.net"
+        if pod_id and str(pod_id).strip():
+            port = os.getenv("PORT", "8000")
+            runpod_url = f"https://{pod_id.strip()}-{port}.proxy.runpod.net"
+            logger.info("تم اكتشاف بيئة RunPod السحابية: %s", runpod_url)
+            return runpod_url
 
-        # 3. روابط الأنفاق المؤقتة (Cloudflare Tunnel / ngrok) إن وجدت
-        tunnel_url = os.getenv("TUNNEL_URL") or os.getenv("CLOUDFLARE_URL")
-        if tunnel_url:
-            return str(tunnel_url).strip().rstrip("/")
+        # 3. فحص بيئة Google Colab / نفق Cloudflare Tunnel من ملفات السجلات
+        # فحص ملفات الإشارة السريعة المباشرة (tunnel_url.txt)
+        tunnel_txt_candidates = [
+            Path("/content/tunnel_url.txt"),
+            Path("/tmp/tunnel_url.txt"),
+            Path.cwd() / "tunnel_url.txt",
+        ]
+        for t_path in tunnel_txt_candidates:
+            if t_path.is_file():
+                try:
+                    txt = t_path.read_text(encoding="utf-8").strip()
+                    if txt.startswith("http") and ("localhost" not in txt and "127.0.0.1" not in txt):
+                        logger.info("تم اكتشاف رابط النفق من ملف الإشارة %s: %s", t_path, txt)
+                        return txt.rstrip("/")
+                except Exception:
+                    pass
 
-        # 4. الرابط الافتراضي المحلي
+        # فحص ملفات سجلات Cloudflare Tunnel بحثاً عن رابط trycloudflare.com
+        cloudflare_log_candidates = [
+            Path("/content/cloudflared.log"),
+            Path("/content/cloudflared.stdout.log"),
+            Path("/tmp/cloudflared.log"),
+            Path.cwd() / "cloudflared.log",
+            Path.cwd() / "tunnel.log",
+        ]
+        cf_pattern = re.compile(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com")
+        for log_path in cloudflare_log_candidates:
+            if log_path.is_file():
+                try:
+                    content = log_path.read_text(encoding="utf-8", errors="ignore")
+                    matches = cf_pattern.findall(content)
+                    if matches:
+                        detected_cf = matches[-1].strip().rstrip("/")
+                        logger.info("تم اكتشاف رابط Cloudflare Tunnel من سجلات %s: %s", log_path, detected_cf)
+                        return detected_cf
+                except Exception:
+                    pass
+
+        # 4. محاولة استعلام ngrok API المحلي إذا كان قيد التشغيل
+        try:
+            req = urllib.request.Request("http://127.0.0.1:4040/api/tunnels", headers={"Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=1.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                for tun in data.get("tunnels", []):
+                    p_url = tun.get("public_url")
+                    if p_url and p_url.startswith("https"):
+                        logger.info("تم اكتشاف رابط ngrok العام: %s", p_url)
+                        return p_url.rstrip("/")
+        except Exception:
+            pass
+
+        # 5. إذا تم تحديد إعداد صريح ولكنه localhost
+        explicit_url = getattr(settings, "SERVER_PUBLIC_URL", "") or os.getenv("SERVER_PUBLIC_URL")
+        if explicit_url and str(explicit_url).strip():
+            return str(explicit_url).strip().rstrip("/")
+
+        # 6. الرابط الافتراضي المحلي
         port = os.getenv("PORT", "8000")
         return f"http://localhost:{port}"
 
@@ -81,7 +146,7 @@ class PlatformSyncService:
     # أولاً: تسجيل رابط الخادم والمفتاح في المنصة (Register Server Settings)
     # ─────────────────────────────────────────────────────────────
 
-    def register_server_settings_sync(self) -> Dict[str, Any]:
+    def register_server_settings_sync(self, explicit_url: Optional[str] = None) -> Dict[str, Any]:
         """إرسال الدومين ومفتاح API إلى نقطة نهاية المنصة:
         POST /api/voice-cloning/server-settings
         """
@@ -94,7 +159,7 @@ class PlatformSyncService:
                 "skipped": True,
             }
 
-        server_url = self.detect_server_url()
+        server_url = (explicit_url and str(explicit_url).strip().rstrip("/")) or self.detect_server_url()
         api_key = settings.API_KEY
         timeout_seconds = int(getattr(settings, "PLATFORM_TIMEOUT", 600))
 
@@ -141,9 +206,9 @@ class PlatformSyncService:
             logger.warning("تعذر الاتصال بالمنصة لتسجيل الخادم: %s", e)
             return {"success": False, "error": str(e)}
 
-    async def register_server_settings(self) -> Dict[str, Any]:
+    async def register_server_settings(self, explicit_url: Optional[str] = None) -> Dict[str, Any]:
         """الغلاف اللاتزامني لتسجيل إعدادات الخادم."""
-        return await asyncio.to_thread(self.register_server_settings_sync)
+        return await asyncio.to_thread(self.register_server_settings_sync, explicit_url)
 
     # ─────────────────────────────────────────────────────────────
     # ثانياً: تحميل وتخزين الأصوات وعينات الضوضاء في SQLite
@@ -487,12 +552,30 @@ class PlatformSyncService:
         """الغلاف اللاتزامني لمزامنة الأصوات والضوضاء."""
         return await asyncio.to_thread(self.sync_voices_and_noise_sync, force)
 
+    async def _poll_and_register_tunnel(self, max_wait_seconds: int = 90, interval: float = 2.0) -> None:
+        """مراقبة دورية في الخلفية لاكتشاف رابط كلاود فلير (أو الرابط العام) وإرساله للمنصة فور تولده."""
+        elapsed = 0.0
+        while elapsed < max_wait_seconds:
+            await asyncio.sleep(interval)
+            elapsed += interval
+            detected = self.detect_server_url()
+            if detected and "localhost" not in detected and "127.0.0.1" not in detected:
+                last_reg = self.db.get_meta("last_registered_server_url")
+                if last_reg != detected:
+                    logger.info("⚡ تم اكتشاف الرابط العام للمنصة تلقائياً: %s (جاري التسجيل...)", detected)
+                    await self.register_server_settings(explicit_url=detected)
+                break
+
     async def run_startup_workflow(self) -> None:
         """تشغيل دورة المزامنة الكاملة عند إقلاع الخادم لأول مرة."""
         try:
             # 1. إرسال الدومين ومفتاح API للمنصة
             if getattr(settings, "PLATFORM_REGISTER_ON_STARTUP", True):
-                await self.register_server_settings()
+                initial_url = self.detect_server_url()
+                await self.register_server_settings(explicit_url=initial_url)
+                # إذا كان الرابط لا يزال محلياً (كما في كولاب قبل اكتمال إقلاع نفق كلاودفلير)، نشغل مراقباً تلقائياً
+                if "localhost" in initial_url or "127.0.0.1" in initial_url:
+                    asyncio.create_task(self._poll_and_register_tunnel(max_wait_seconds=90, interval=2.0))
 
             # 2. مزامنة وتحميل عينات الأصوات والضوضاء
             if getattr(settings, "PLATFORM_SYNC_ON_STARTUP", True):

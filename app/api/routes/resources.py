@@ -49,7 +49,7 @@ async def trigger_platform_sync(force: bool = Query(False, description="إعاد
 
 
 @router.post("/register-server", dependencies=[Depends(require_api_key)])
-async def trigger_server_registration():
+async def trigger_server_registration(server_url: str | None = Query(None, description="رابط الخادم الصريح لإرساله للمنصة")):
     """إعادة إرسال دومين هذا الخادم الحالي ومفتاح API إلى نقطة نهاية المنصة الخارجية."""
-    result = await platform_sync_service.register_server_settings()
+    result = await platform_sync_service.register_server_settings(explicit_url=server_url)
     return result

@@ -538,6 +538,14 @@ if [[ -z "$PUBLIC_URL" ]]; then
     exit 1
 fi
 
+# Save the public URL to indicator file so FastAPI startup or watcher detects it immediately
+echo "$PUBLIC_URL" > /content/tunnel_url.txt
+echo "$PUBLIC_URL" > /tmp/tunnel_url.txt
+
+# Proactively notify FastAPI register endpoint with the public Cloudflare URL
+curl -fsS -X POST "http://127.0.0.1:${PORT}/api/v1/resources/register-server?server_url=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$PUBLIC_URL'))")" \
+    -H "accept: application/json" >/dev/null 2>&1 || true
+
 echo ""
 echo "============================================================"
 echo "VOXCPM API IS RUNNING"
