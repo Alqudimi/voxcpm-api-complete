@@ -282,6 +282,8 @@ OUTPUT_CODEC=libopus
 
 HOST=0.0.0.0
 PORT=8000
+VM_PRECISION=fp32
+PLATFORM_BASE_URL=https://revenues-complement-metal-cardiff.trycloudflare.com
 ENV_EOF
 fi
 
