@@ -387,17 +387,22 @@ def mix_upload(
     if noise_sample_id:
         from app.services.platform.fast_resource_cache import fast_resource_cache
         item = fast_resource_cache.get_noise(noise_sample_id)
-        if item is not None:
+        if item is not None and item.audio_bytes:
             noise = item.audio_bytes
             noise_ref = item.filename
         else:
             from app.services.platform.platform_sync_service import platform_sync_service
-            sample = platform_sync_service.db.get_noise_sample(noise_sample_id)
-            if sample and sample.get("local_audio_path") and Path(sample["local_audio_path"]).is_file():
-                noise = Path(sample["local_audio_path"]).read_bytes()
-                noise_ref = Path(sample["local_audio_path"]).name
+            ensured_item = platform_sync_service.ensure_noise_sample_audio(noise_sample_id)
+            if ensured_item is not None and ensured_item.audio_bytes:
+                noise = ensured_item.audio_bytes
+                noise_ref = ensured_item.filename
             else:
-                raise HTTPException(404, f"Noise sample not found: {noise_sample_id}")
+                sample = platform_sync_service.db.get_noise_sample(noise_sample_id)
+                if sample and sample.get("local_audio_path") and Path(sample["local_audio_path"]).is_file():
+                    noise = Path(sample["local_audio_path"]).read_bytes()
+                    noise_ref = Path(sample["local_audio_path"]).name
+                else:
+                    raise HTTPException(404, f"Noise sample not found: {noise_sample_id}")
     elif noise_audio is not None and getattr(noise_audio, "filename", None):
         noise = service._read_upload(noise_audio)
         noise_ref = noise_audio.filename or "noise.audio"

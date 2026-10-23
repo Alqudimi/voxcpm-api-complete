@@ -6,12 +6,14 @@ import shutil
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from app.core.config import settings
 from .database import PlatformDatabase
+from .fast_resource_cache import FastNoiseSample, FastVoiceSample, fast_resource_cache
 
 logger = logging.getLogger("voxcpm.platform_sync")
 
@@ -147,41 +149,73 @@ class PlatformSyncService:
     # ثانياً: تحميل وتخزين الأصوات وعينات الضوضاء في SQLite
     # ─────────────────────────────────────────────────────────────
 
+    def normalize_platform_url(self, url: str) -> str:
+        """تصحيح الرابط وتحويله ليعتمد على رابط المنصة الأساسي (تجاوز الدومينات الافتراضية كـ example.com)."""
+        if not url:
+            return ""
+        url = str(url).strip()
+        base_url = self.get_platform_base_url()
+        if not base_url:
+            return url
+
+        base_url = base_url.rstrip("/")
+        if url.startswith("/"):
+            return f"{base_url}{url}"
+
+        parsed = urllib.parse.urlparse(url)
+        base_parsed = urllib.parse.urlparse(base_url)
+
+        # إذا كان الرابط يحتوي على دومين مختلف أو افتراضي مثل example.com أو localhost،
+        # نوجهه دائماً إلى رابط المنصة الفعلي في PLATFORM_BASE_URL
+        if parsed.netloc != base_parsed.netloc:
+            return urllib.parse.urlunparse((
+                base_parsed.scheme,
+                base_parsed.netloc,
+                parsed.path,
+                parsed.params,
+                parsed.query,
+                parsed.fragment,
+            ))
+        return url
+
     def _download_file(self, url: str, target_path: Path) -> Optional[Path]:
         """تحميل ملف صوتي من رابط وحفظه محلياً مع تخطي التحميل إذا كان موجوداً مسبقاً."""
         if not url:
             return None
 
-        # إذا كان الرابط نسبياً، نضيف الرابط الأساسي للمنصة
-        if url.startswith("/"):
-            base_url = self.get_platform_base_url()
-            if base_url:
-                url = f"{base_url}{url}"
-
-        # إذا كان الملف موجوداً مسبقاً وبحجم سليم (> 1KB) نتخطى إعادة تنزيله
+        # 1. إذا كان الملف موجوداً مسبقاً وبحجم سليم (> 1KB) نتخطى إعادة تنزيله
         if target_path.exists() and target_path.stat().st_size > 1024:
             return target_path
 
+        # 2. تطبيع الرابط
+        norm_url = self.normalize_platform_url(url)
+        target_path.parent.mkdir(parents=True, exist_ok=True)
         temp_target = target_path.with_suffix(f"{target_path.suffix}.tmp")
-        req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": f"VoxCPM-API/{settings.APP_VERSION}",
-                "Accept": "*/*",
-            },
-        )
 
-        try:
-            with urllib.request.urlopen(req, timeout=60.0) as response:
-                with open(temp_target, "wb") as f:
-                    shutil.copyfileobj(response, f)
-            temp_target.replace(target_path)
-            return target_path
-        except Exception as exc:
-            if temp_target.exists():
-                temp_target.unlink(missing_ok=True)
-            logger.warning("فشل تنزيل الملف الصوتي من (%s): %s", url, exc)
-            return None
+        headers = {
+            "User-Agent": f"VoxCPM-API/{settings.APP_VERSION}",
+            "Accept": "*/*",
+        }
+
+        # محاولة التنزيل
+        for attempt_url in [norm_url, url]:
+            if not attempt_url:
+                continue
+            req = urllib.request.Request(attempt_url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=30.0) as response:
+                    with open(temp_target, "wb") as f:
+                        shutil.copyfileobj(response, f)
+                if temp_target.exists() and temp_target.stat().st_size > 512:
+                    temp_target.replace(target_path)
+                    return target_path
+            except Exception as exc:
+                if temp_target.exists():
+                    temp_target.unlink(missing_ok=True)
+                logger.debug("فشلت محاولة تنزيل من (%s): %s", attempt_url, exc)
+
+        logger.warning("فشل تنزيل الملف الصوتي نهائياً من (%s)", norm_url)
+        return None
 
     def _determine_extension(self, sample_dict: Dict[str, Any], default: str = ".wav") -> str:
         orig = sample_dict.get("original_filename") or ""
@@ -198,7 +232,7 @@ class PlatformSyncService:
         return default
 
     def sync_voices_and_noise_sync(self, force: bool = False) -> Dict[str, Any]:
-        """جلب شجرة الأصوات والضوضاء، تحميل ملفاتها وحفظها في SQLite محلياً."""
+        """جلب شجرة الأصوات والضوضاء، حفظ البيانات الوصفية فوراً في SQLite، وتحميل ملفاتها بالتوازي."""
         base_url = self.get_platform_base_url()
         if not base_url:
             logger.info("تخطي مزامنة الأصوات والضوضاء: لم يتم تعيين PLATFORM_BASE_URL في .env")
@@ -208,11 +242,6 @@ class PlatformSyncService:
                 "skipped": True,
             }
 
-        # فحص إن كانت البيانات موجودة مسبقاً ولم يُطلب فرض التحديث
-        if not force and self.db.has_data():
-            logger.info("البيانات مخزنة مسبقاً في SQLite، سيتم التحقق من اكتمال الملفات الصوتية...")
-
-        # مسارات محتملة لجلب الأصوات بحسب توثيق المنصة
         candidate_paths = [
             "/api/voice-cloning/voices-and-noise",
             "/api/voices-and-noise",
@@ -249,72 +278,93 @@ class PlatformSyncService:
 
         voices = data.get("voices", [])
         noise_profiles = data.get("noise_profiles", [])
-        local_files_map = {}
 
+        # الخطوة 1: الحفظ الفوري للبيانات الوصفية في SQLite لتكون المعرفات جاهزة لحظياً
+        self.db.save_voices_and_noise(voices, noise_profiles, {})
         logger.info(
-            "تم استلام %d صوت و %d ملف ضوضاء من المنصة. بدء فحص وتحميل الملفات الصوتية...",
+            "⚡ تم حفظ البيانات الوصفية لـ %d صوت و %d ملف ضوضاء في SQLite فورياً. بدء التنزيل المتوازي...",
             len(voices),
             len(noise_profiles),
         )
 
-        # 1. فحص وتحميل عينات الأصوات
-        downloaded_voices = 0
-        for voice in voices:
-            for sample in voice.get("samples", []):
-                s_uuid = str(sample.get("uuid"))
-                ext = self._determine_extension(sample, default=".wav")
+        # الخطوة 2: جمع كافة مهام التنزيل لتنفيذها بالتوازي
+        def _download_voice_task(voice_dict: dict, sample_dict: dict) -> Tuple[str, Optional[str], Optional[str]]:
+            s_uuid = str(sample_dict.get("uuid"))
+            ext = self._determine_extension(sample_dict, default=".wav")
+            target = self.voice_samples_dir / f"{s_uuid}{ext}"
+            audio_url = sample_dict.get("audio_url") or f"{base_url}/api/voice-cloning/audio/voice-sample/{s_uuid}"
 
-                local_audio_path = None
-                local_cleaned_audio_path = None
+            local_audio = None
+            res = self._download_file(audio_url, target)
+            if res and res.exists():
+                local_audio = str(res)
+                # تسجيل فوري في RAM
+                try:
+                    s_copy = dict(sample_dict)
+                    s_copy.setdefault("person_name", voice_dict.get("name", ""))
+                    s_copy.setdefault("person_id", voice_dict.get("id"))
+                    s_copy.setdefault("person_uuid", voice_dict.get("uuid"))
+                    data_bytes = res.read_bytes()
+                    fast_resource_cache.register_voice_data(s_copy, data_bytes, local_audio)
+                    self.db.update_voice_sample_path(s_uuid, local_audio, is_cleaned=False)
+                except Exception as ex:
+                    logger.debug("خطأ أثناء تسجيل العينة %s في RAM: %s", s_uuid, ex)
 
-                # تنزيل الصوت الأساسي
-                audio_url = sample.get("audio_url")
-                if audio_url:
-                    target = self.voice_samples_dir / f"{s_uuid}{ext}"
-                    res = self._download_file(audio_url, target)
-                    if res:
-                        local_audio_path = str(res)
-                        downloaded_voices += 1
+            # تنزيل النسخة المنقاة إن وجدت
+            cleaned_url = sample_dict.get("cleaned_audio_url")
+            local_cleaned = None
+            if cleaned_url and cleaned_url != audio_url:
+                target_cleaned = self.voice_samples_dir / f"{s_uuid}_cleaned{ext}"
+                res_c = self._download_file(cleaned_url, target_cleaned)
+                if res_c and res_c.exists():
+                    local_cleaned = str(res_c)
+                    self.db.update_voice_sample_path(s_uuid, local_cleaned, is_cleaned=True)
 
-                # تنزيل الصوت المنقى إن وجد
-                cleaned_url = sample.get("cleaned_audio_url")
-                if cleaned_url and cleaned_url != audio_url:
-                    target_cleaned = self.voice_samples_dir / f"{s_uuid}_cleaned{ext}"
-                    res_c = self._download_file(cleaned_url, target_cleaned)
-                    if res_c:
-                        local_cleaned_audio_path = str(res_c)
+            return s_uuid, local_audio, local_cleaned
 
-                local_files_map[s_uuid] = {
-                    "local_audio_path": local_audio_path,
-                    "local_cleaned_audio_path": local_cleaned_audio_path,
-                }
+        def _download_noise_task(profile_dict: dict, sample_dict: dict) -> Tuple[str, Optional[str]]:
+            s_uuid = str(sample_dict.get("uuid"))
+            ext = self._determine_extension(sample_dict, default=".mp3")
+            target = self.noise_samples_dir / f"{s_uuid}{ext}"
+            audio_url = sample_dict.get("audio_url") or f"{base_url}/api/voice-cloning/audio/noise-sample/{s_uuid}"
 
-        # 2. فحص وتحميل عينات الضوضاء
-        downloaded_noise = 0
-        for profile in noise_profiles:
-            for sample in profile.get("samples", []):
-                s_uuid = str(sample.get("uuid"))
-                ext = self._determine_extension(sample, default=".mp3")
+            local_audio = None
+            res = self._download_file(audio_url, target)
+            if res and res.exists():
+                local_audio = str(res)
+                try:
+                    s_copy = dict(sample_dict)
+                    s_copy.setdefault("noise_profile_name", profile_dict.get("name", ""))
+                    s_copy.setdefault("noise_profile_id", profile_dict.get("id"))
+                    s_copy.setdefault("noise_profile_uuid", profile_dict.get("uuid"))
+                    data_bytes = res.read_bytes()
+                    fast_resource_cache.register_noise_data(s_copy, data_bytes, local_audio)
+                    self.db.update_noise_sample_path(s_uuid, local_audio)
+                except Exception as ex:
+                    logger.debug("خطأ أثناء تسجيل الضوضاء %s في RAM: %s", s_uuid, ex)
 
-                local_audio_path = None
-                audio_url = sample.get("audio_url")
-                if audio_url:
-                    target = self.noise_samples_dir / f"{s_uuid}{ext}"
-                    res = self._download_file(audio_url, target)
-                    if res:
-                        local_audio_path = str(res)
-                        downloaded_noise += 1
+            return s_uuid, local_audio
 
-                local_files_map[s_uuid] = {
-                    "local_audio_path": local_audio_path,
-                }
+        # تنفيذ التنزيل بالتوازي بواسطة ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            v_futures = []
+            for voice in voices:
+                for sample in voice.get("samples", []):
+                    v_futures.append(executor.submit(_download_voice_task, voice, sample))
 
-        # 3. حفظ البيانات في SQLite
-        self.db.save_voices_and_noise(voices, noise_profiles, local_files_map)
+            n_futures = []
+            for profile in noise_profiles:
+                for sample in profile.get("samples", []):
+                    n_futures.append(executor.submit(_download_noise_task, profile, sample))
 
-        # 4. تحميل وتحديث كاش الذاكرة RAM الفوري لحظياً
+            for f in as_completed(v_futures + n_futures):
+                try:
+                    f.result()
+                except Exception as exc:
+                    logger.warning("استثناء أثناء مهمة تنزيل وسائط: %s", exc)
+
+        # الخطوة 3: تسخين نهائي للذاكرة السريعة
         try:
-            from .fast_resource_cache import fast_resource_cache
             fast_resource_cache.warm_up(self.db.db_path)
         except Exception as exc:
             logger.warning("تعذر تسخين كاش الذاكرة السريعة بعد المزامنة: %s", exc)
@@ -332,6 +382,106 @@ class PlatformSyncService:
             "message": "تمت مزامنة وحفظ جميع الموارد محلياً بنجاح.",
             "summary": summary,
         }
+
+    def ensure_voice_sample_audio(self, identifier: Any) -> Optional[FastVoiceSample]:
+        """ضمان توفر الملف الصوتي لعينة الصوت في الذاكرة الحية فورياً (On-Demand Fetch)."""
+        if identifier is None or not str(identifier).strip():
+            return None
+
+        val = str(identifier).strip()
+        # 1. البحث في RAM أولاً
+        item = fast_resource_cache.get_voice(int(val) if val.isdigit() else val)
+        if item is not None and item.raw_audio_bytes:
+            return item
+
+        # 2. البحث في SQLite
+        sample = self.db.get_voice_sample(val)
+        if not sample:
+            # إذا لم تكن موجودة، نجري مزامنة فورية ونعيد الاستعلام
+            self.sync_voices_and_noise_sync(force=False)
+            sample = self.db.get_voice_sample(val)
+            if not sample:
+                return None
+
+        s_uuid = str(sample["uuid"])
+        ext = self._determine_extension(sample, default=".wav")
+        target_path = self.voice_samples_dir / f"{s_uuid}{ext}"
+
+        # 3. إذا كان الملف موجوداً بالفعل على القرص
+        local_path_str = sample.get("local_cleaned_audio_path") or sample.get("local_audio_path")
+        disk_file = Path(local_path_str) if local_path_str and Path(local_path_str).is_file() else None
+        if not disk_file and target_path.is_file() and target_path.stat().st_size > 512:
+            disk_file = target_path
+
+        if disk_file:
+            data = disk_file.read_bytes()
+            return fast_resource_cache.register_voice_data(sample, data, str(disk_file))
+
+        # 4. تنزيل الملف لحظياً من المنصة
+        base_url = self.get_platform_base_url()
+        candidates = []
+        if sample.get("cleaned_audio_url"):
+            candidates.append(sample["cleaned_audio_url"])
+        if sample.get("audio_url"):
+            candidates.append(sample["audio_url"])
+        if base_url:
+            candidates.append(f"{base_url}/api/voice-cloning/audio/cleaned-sample/{s_uuid}")
+            candidates.append(f"{base_url}/api/voice-cloning/audio/voice-sample/{s_uuid}")
+
+        for u in candidates:
+            res = self._download_file(u, target_path)
+            if res and res.is_file() and res.stat().st_size > 512:
+                data = res.read_bytes()
+                self.db.update_voice_sample_path(s_uuid, str(res))
+                return fast_resource_cache.register_voice_data(sample, data, str(res))
+
+        return None
+
+    def ensure_noise_sample_audio(self, identifier: Any) -> Optional[FastNoiseSample]:
+        """ضمان توفر الملف الصوتي لعينة الضوضاء في الذاكرة الحية فورياً (On-Demand Fetch)."""
+        if identifier is None or not str(identifier).strip():
+            return None
+
+        val = str(identifier).strip()
+        item = fast_resource_cache.get_noise(int(val) if val.isdigit() else val)
+        if item is not None and item.audio_bytes:
+            return item
+
+        sample = self.db.get_noise_sample(val)
+        if not sample:
+            self.sync_voices_and_noise_sync(force=False)
+            sample = self.db.get_noise_sample(val)
+            if not sample:
+                return None
+
+        s_uuid = str(sample["uuid"])
+        ext = self._determine_extension(sample, default=".mp3")
+        target_path = self.noise_samples_dir / f"{s_uuid}{ext}"
+
+        local_path_str = sample.get("local_audio_path")
+        disk_file = Path(local_path_str) if local_path_str and Path(local_path_str).is_file() else None
+        if not disk_file and target_path.is_file() and target_path.stat().st_size > 512:
+            disk_file = target_path
+
+        if disk_file:
+            data = disk_file.read_bytes()
+            return fast_resource_cache.register_noise_data(sample, data, str(disk_file))
+
+        base_url = self.get_platform_base_url()
+        candidates = []
+        if sample.get("audio_url"):
+            candidates.append(sample["audio_url"])
+        if base_url:
+            candidates.append(f"{base_url}/api/voice-cloning/audio/noise-sample/{s_uuid}")
+
+        for u in candidates:
+            res = self._download_file(u, target_path)
+            if res and res.is_file() and res.stat().st_size > 512:
+                data = res.read_bytes()
+                self.db.update_noise_sample_path(s_uuid, str(res))
+                return fast_resource_cache.register_noise_data(sample, data, str(res))
+
+        return None
 
     async def sync_voices_and_noise(self, force: bool = False) -> Dict[str, Any]:
         """الغلاف اللاتزامني لمزامنة الأصوات والضوضاء."""

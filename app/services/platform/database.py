@@ -337,17 +337,29 @@ class PlatformDatabase:
             )
 
     def get_voice_sample(self, uuid_or_id: str | int) -> Optional[Dict[str, Any]]:
-        """البحث عن عينة صوت بواسطة UUID أو ID."""
+        """البحث عن عينة صوت بواسطة sample uuid/id أو person/voice uuid/id."""
         with self._get_connection() as conn:
-            query = "SELECT * FROM voice_samples WHERE uuid=? OR id=?"
-            row = conn.execute(query, (str(uuid_or_id), str(uuid_or_id))).fetchone()
+            query = """
+                SELECT * FROM voice_samples
+                WHERE uuid=? OR id=? OR person_uuid=? OR person_id=?
+                ORDER BY (uuid=?) DESC, (id=?) DESC, is_default DESC, id ASC
+                LIMIT 1
+            """
+            s = str(uuid_or_id)
+            row = conn.execute(query, (s, s, s, s, s, s)).fetchone()
             return dict(row) if row else None
 
     def get_noise_sample(self, uuid_or_id: str | int) -> Optional[Dict[str, Any]]:
-        """البحث عن عينة ضوضاء بواسطة UUID أو ID."""
+        """البحث عن عينة ضوضاء بواسطة sample uuid/id أو noise profile uuid/id."""
         with self._get_connection() as conn:
-            query = "SELECT * FROM noise_samples WHERE uuid=? OR id=?"
-            row = conn.execute(query, (str(uuid_or_id), str(uuid_or_id))).fetchone()
+            query = """
+                SELECT * FROM noise_samples
+                WHERE uuid=? OR id=? OR noise_profile_uuid=? OR noise_profile_id=?
+                ORDER BY (uuid=?) DESC, (id=?) DESC, is_default DESC, id ASC
+                LIMIT 1
+            """
+            s = str(uuid_or_id)
+            row = conn.execute(query, (s, s, s, s, s, s)).fetchone()
             return dict(row) if row else None
 
     def list_voices(self) -> List[Dict[str, Any]]:
@@ -379,6 +391,27 @@ class PlatformDatabase:
                 p_dict["samples"] = [dict(s) for s in samples]
                 result.append(p_dict)
             return result
+
+    def update_voice_sample_path(self, uuid_or_id: str | int, local_path: str, is_cleaned: bool = False) -> None:
+        """تحديث المسار المحلي لعينة الصوت فور تنزيلها."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            col = "local_cleaned_audio_path" if is_cleaned else "local_audio_path"
+            s = str(uuid_or_id)
+            conn.execute(
+                f"UPDATE voice_samples SET {col}=?, updated_at=? WHERE uuid=? OR id=?",
+                (local_path, now, s, s),
+            )
+
+    def update_noise_sample_path(self, uuid_or_id: str | int, local_path: str) -> None:
+        """تحديث المسار المحلي لعينة الضوضاء فور تنزيلها."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            s = str(uuid_or_id)
+            conn.execute(
+                "UPDATE noise_samples SET local_audio_path=?, updated_at=? WHERE uuid=? OR id=?",
+                (local_path, now, s, s),
+            )
 
     def get_summary(self) -> Dict[str, Any]:
         """إرجاع ملخص إحصائي للموارد المخزنة في SQLite وحالة آخر مزامنة."""

@@ -76,7 +76,7 @@ def _resolve_reference_audio(
     identifier: Any | None,
     prompt_text: str | None,
 ) -> Tuple[Any, str | None]:
-    """استرجاع فوري لعينة الصوت المرجعية من ذاكرة RAM في زمن شبه صفري (<1 microsecond)."""
+    """استرجاع فوري لعينة الصوت المرجعية من ذاكرة RAM في زمن شبه صفري (<1 microsecond) مع جلب عند الطلب."""
     # 1. إذا تم رفع ملف صوتي يدوي
     if uploaded_file is not None and getattr(uploaded_file, "filename", None):
         return uploaded_file, prompt_text
@@ -85,11 +85,17 @@ def _resolve_reference_audio(
     if identifier is not None and str(identifier).strip():
         val = str(identifier).strip()
         item = fast_resource_cache.get_voice(int(val) if val.isdigit() else val)
-        if item is not None:
+        if item is not None and item.raw_audio_bytes:
             prompt = prompt_text or item.reference_text
             return VoiceAudioInMemoryWrapper(item.raw_audio_bytes, item.filename), prompt
 
-        # 3. Fallback: قاعدة بيانات SQLite والقرص
+        # 3. محاولة الضمان والتحميل الفوري عبر On-Demand Sync من المنصة
+        ensured_item = platform_sync_service.ensure_voice_sample_audio(val)
+        if ensured_item is not None and ensured_item.raw_audio_bytes:
+            prompt = prompt_text or ensured_item.reference_text
+            return VoiceAudioInMemoryWrapper(ensured_item.raw_audio_bytes, ensured_item.filename), prompt
+
+        # 4. Fallback: قاعدة بيانات SQLite والقرص
         sample = platform_sync_service.db.get_voice_sample(val)
         if sample is not None:
             local_path = sample.get("local_cleaned_audio_path") or sample.get("local_audio_path")
@@ -97,7 +103,7 @@ def _resolve_reference_audio(
                 data = Path(local_path).read_bytes()
                 prompt = prompt_text or sample.get("reference_text") or sample.get("sample_text")
                 return VoiceAudioInMemoryWrapper(data, Path(local_path).name), prompt
-            raise HTTPException(404, f"الملف الصوتي للعينة {identifier} غير متوفر على القرص")
+            raise HTTPException(404, f"الملف الصوتي للعينة {identifier} غير متوفر على القرص أو تعذر تنزيله")
         raise HTTPException(404, f"عينة الصوت غير موجودة: {identifier}")
 
     raise HTTPException(
@@ -110,7 +116,7 @@ def _resolve_noise_bytes(
     uploaded_file: Any | None,
     identifier: Any | None,
 ) -> Tuple[bytes, str]:
-    """استرجاع فوري لملف الضوضاء من ذاكرة RAM في زمن شبه صفري (<1 microsecond)."""
+    """استرجاع فوري لملف الضوضاء من ذاكرة RAM في زمن شبه صفري (<1 microsecond) مع جلب عند الطلب."""
     # 1. إذا تم رفع ملف ضوضاء يدوي
     if uploaded_file is not None and getattr(uploaded_file, "filename", None):
         noise_bytes = audio_mixer_service._read_upload(uploaded_file)
@@ -120,17 +126,22 @@ def _resolve_noise_bytes(
     if identifier is not None and str(identifier).strip():
         val = str(identifier).strip()
         item = fast_resource_cache.get_noise(int(val) if val.isdigit() else val)
-        if item is not None:
+        if item is not None and item.audio_bytes:
             return item.audio_bytes, item.filename
 
-        # 3. Fallback: قاعدة بيانات SQLite والقرص
+        # 3. محاولة الضمان والتحميل الفوري عبر On-Demand Sync من المنصة
+        ensured_item = platform_sync_service.ensure_noise_sample_audio(val)
+        if ensured_item is not None and ensured_item.audio_bytes:
+            return ensured_item.audio_bytes, ensured_item.filename
+
+        # 4. Fallback: قاعدة بيانات SQLite والقرص
         sample = platform_sync_service.db.get_noise_sample(val)
         if sample is not None:
             local_path = sample.get("local_audio_path")
             if local_path and Path(local_path).is_file():
                 data = Path(local_path).read_bytes()
                 return data, Path(local_path).name
-            raise HTTPException(404, f"الملف الصوتي لعينة الضوضاء {identifier} غير متوفر على القرص")
+            raise HTTPException(404, f"الملف الصوتي لعينة الضوضاء {identifier} غير متوفر على القرص أو تعذر تنزيله")
         raise HTTPException(404, f"عينة الضوضاء غير موجودة: {identifier}")
 
     raise HTTPException(
@@ -140,21 +151,41 @@ def _resolve_noise_bytes(
 
 
 async def _extract_request_data(request: Request) -> Tuple[dict, Any, Any]:
-    """استخراج المعاملات بمرونة سواء كانت مرسلة كـ JSON أو كـ Multipart/Form-data."""
+    """استخراج المعاملات بمرونة سواء كانت مرسلة كـ JSON أو كـ Multipart/Form-data أو Query params."""
+    combined: dict = {}
+    ref_file = None
+    noise_file = None
+
+    # دمج معلمات الـ Query إن وُجدت
+    try:
+        combined.update(dict(request.query_params))
+    except Exception:
+        pass
+
     ct = request.headers.get("content-type", "").lower()
     if "application/json" in ct:
         try:
             body = await request.json()
-            return body if isinstance(body, dict) else {}, None, None
+            if isinstance(body, dict):
+                combined.update(body)
+            return combined, None, None
         except Exception:
-            return {}, None, None
+            return combined, None, None
 
-    # قراءة الفورم والملفات إن وجدت
-    form = await request.form()
-    data = dict(form)
-    ref_file = form.get("reference_audio")
-    noise_file = form.get("noise_audio")
-    return data, ref_file, noise_file
+    # محاولة قراءة الفورم والملفات
+    try:
+        form = await request.form()
+        for k, v in form.items():
+            if k == "reference_audio":
+                ref_file = v
+            elif k == "noise_audio":
+                noise_file = v
+            else:
+                combined[k] = v
+    except Exception:
+        pass
+
+    return combined, ref_file, noise_file
 
 
 @router.post("/clone", dependencies=[Depends(require_api_key)])
@@ -187,7 +218,13 @@ async def clone_voice(
         payload.get("voice_sample_id")
         or payload.get("sample_id")
         or payload.get("voice_id")
+        or payload.get("person_id")
         or payload.get("reference_sample_uuid")
+        or payload.get("voice_uuid")
+        or payload.get("person_uuid")
+        or payload.get("sample_uuid")
+        or payload.get("reference_id")
+        or payload.get("voice")
         or voice_sample_id
         or reference_sample_uuid
     )
@@ -276,14 +313,26 @@ async def clone_voice_and_mix(
         payload.get("voice_sample_id")
         or payload.get("sample_id")
         or payload.get("voice_id")
+        or payload.get("person_id")
         or payload.get("reference_sample_uuid")
+        or payload.get("voice_uuid")
+        or payload.get("person_uuid")
+        or payload.get("sample_uuid")
+        or payload.get("reference_id")
+        or payload.get("voice")
         or voice_sample_id
         or reference_sample_uuid
     )
     noise_id = (
         payload.get("noise_sample_id")
         or payload.get("noise_id")
+        or payload.get("noise_profile_id")
+        or payload.get("profile_id")
         or payload.get("noise_sample_uuid")
+        or payload.get("noise_profile_uuid")
+        or payload.get("noise_asset_id")
+        or payload.get("noise_uuid")
+        or payload.get("noise")
         or noise_sample_id
         or noise_sample_uuid
     )

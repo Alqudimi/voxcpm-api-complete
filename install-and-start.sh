@@ -288,6 +288,8 @@ OUTPUT_CODEC=libopus
 
 HOST=0.0.0.0
 PORT=8000
+VM_PRECISION=fp32
+PLATFORM_BASE_URL=https://voicecloning.novacortexnc.com
 ENV_EOF
     echo "Created $PROJECT/.env"
 else
