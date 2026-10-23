@@ -28,6 +28,13 @@ class PlatformSyncService:
         self.noise_samples_dir = Path(settings.NOISE_SAMPLES_DIR)
         self.voice_samples_dir.mkdir(parents=True, exist_ok=True)
         self.noise_samples_dir.mkdir(parents=True, exist_ok=True)
+        # تحميل الموارد مسبقاً في ذاكرة RAM الفورية (Fast Cache) إن وُجدت
+        try:
+            from .fast_resource_cache import fast_resource_cache
+            if self.db.has_data() and not fast_resource_cache.is_loaded:
+                fast_resource_cache.warm_up(self.db.db_path)
+        except Exception as exc:
+            logger.warning("تعذر تسخين كاش الذاكرة السريعة في __init__: %s", exc)
 
     def detect_server_url(self) -> str:
         """اكتشاف رابط الخادم العام الذي يعمل منه التطبيق تلقائياً وبأعلى دقة."""
@@ -304,6 +311,13 @@ class PlatformSyncService:
 
         # 3. حفظ البيانات في SQLite
         self.db.save_voices_and_noise(voices, noise_profiles, local_files_map)
+
+        # 4. تحميل وتحديث كاش الذاكرة RAM الفوري لحظياً
+        try:
+            from .fast_resource_cache import fast_resource_cache
+            fast_resource_cache.warm_up(self.db.db_path)
+        except Exception as exc:
+            logger.warning("تعذر تسخين كاش الذاكرة السريعة بعد المزامنة: %s", exc)
 
         summary = self.db.get_summary()
         logger.info(

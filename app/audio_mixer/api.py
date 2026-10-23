@@ -375,7 +375,8 @@ def mix_library(
 @router.post("/api/v1/audio/mixes/from-upload", status_code=202)
 def mix_upload(
     source_audio: UploadFile = File(...),
-    noise_audio: UploadFile = File(...),
+    noise_audio: UploadFile | None = File(None),
+    noise_sample_id: str | None = Form(None),
     source_gain_db: float = Form(0),
     noise_gain_db: float = Form(-18),
     variation_seed: int | None = Form(None),
@@ -383,13 +384,32 @@ def mix_upload(
     _: object = Depends(require_process),
 ):
     source = service._read_upload(source_audio)
-    noise = service._read_upload(noise_audio)
+    if noise_sample_id:
+        from app.services.platform.fast_resource_cache import fast_resource_cache
+        item = fast_resource_cache.get_noise(noise_sample_id)
+        if item is not None:
+            noise = item.audio_bytes
+            noise_ref = item.filename
+        else:
+            from app.services.platform.platform_sync_service import platform_sync_service
+            sample = platform_sync_service.db.get_noise_sample(noise_sample_id)
+            if sample and sample.get("local_audio_path") and Path(sample["local_audio_path"]).is_file():
+                noise = Path(sample["local_audio_path"]).read_bytes()
+                noise_ref = Path(sample["local_audio_path"]).name
+            else:
+                raise HTTPException(404, f"Noise sample not found: {noise_sample_id}")
+    elif noise_audio is not None and getattr(noise_audio, "filename", None):
+        noise = service._read_upload(noise_audio)
+        noise_ref = noise_audio.filename or "noise.audio"
+    else:
+        raise HTTPException(400, "Must provide noise_sample_id or upload noise_audio")
+
     return {
         "job_id": service.submit_mix_bytes(
             source,
             source_audio.filename or "source.audio",
             noise,
-            noise_audio.filename or "noise.audio",
+            noise_ref,
             source_gain_db,
             noise_gain_db,
             variation_seed,
@@ -434,7 +454,8 @@ def process_from_library(
 @router.post("/api/v1/audio/process/from-upload")
 def process_from_upload(
     source_audio: UploadFile = File(...),
-    noise_audio: UploadFile = File(...),
+    noise_audio: UploadFile | None = File(None),
+    noise_sample_id: str | None = Form(None),
     source_gain_db: float = Form(0),
     noise_gain_db: float = Form(-18),
     noise_mix_percent: float | None = Form(None),
@@ -443,14 +464,40 @@ def process_from_upload(
     _: object = Depends(require_process),
 ):
     noise_gain_db = resolve_noise_gain(noise_gain_db, noise_mix_percent)
-    data = service.process_sync_uploads(
-        source_audio,
-        noise_upload=noise_audio,
-        source_gain=source_gain_db,
-        noise_gain=noise_gain_db,
-        variation_seed=variation_seed,
-        output_format=output_format,
-    )
+    if noise_sample_id:
+        from app.services.platform.fast_resource_cache import fast_resource_cache
+        item = fast_resource_cache.get_noise(noise_sample_id)
+        if item is not None:
+            noise_bytes = item.audio_bytes
+            noise_ref = item.filename
+        else:
+            from app.services.platform.platform_sync_service import platform_sync_service
+            sample = platform_sync_service.db.get_noise_sample(noise_sample_id)
+            if sample and sample.get("local_audio_path") and Path(sample["local_audio_path"]).is_file():
+                noise_bytes = Path(sample["local_audio_path"]).read_bytes()
+                noise_ref = Path(sample["local_audio_path"]).name
+            else:
+                raise HTTPException(404, f"Noise sample not found: {noise_sample_id}")
+        data = service.process_sync_uploads(
+            source_audio,
+            noise_bytes=noise_bytes,
+            noise_reference=noise_ref,
+            source_gain=source_gain_db,
+            noise_gain=noise_gain_db,
+            variation_seed=variation_seed,
+            output_format=output_format,
+        )
+    elif noise_audio is not None and getattr(noise_audio, "filename", None):
+        data = service.process_sync_uploads(
+            source_audio,
+            noise_upload=noise_audio,
+            source_gain=source_gain_db,
+            noise_gain=noise_gain_db,
+            variation_seed=variation_seed,
+            output_format=output_format,
+        )
+    else:
+        raise HTTPException(400, "Must provide noise_sample_id or upload noise_audio")
     output_format = service.resolve_output_format(output_format)
     spec = ffmpeg.output_spec(output_format)
     return Response(

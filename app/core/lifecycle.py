@@ -22,6 +22,14 @@ async def lifespan(app: FastAPI):
 
         logging.getLogger(__name__).warning("ensure_engine_loaded fallback: %s", exc)
 
+    # تسخين وتحميل كاش الذاكرة RAM الفوري للعينات والضوضاء (Zero-Disk I/O)
+    try:
+        from app.services.platform.fast_resource_cache import fast_resource_cache
+        fast_resource_cache.warm_up()
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("fast_resource_cache warm_up failed: %s", exc)
+
     # مزامنة المنصة الخارجية: تسجيل إعدادات الخادم + تحميل وحفظ العينات والضوضاء في SQLite
     try:
         import asyncio

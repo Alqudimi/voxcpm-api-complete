@@ -7,13 +7,15 @@ router = APIRouter(prefix="/resources", tags=["Platform Resources"])
 
 @router.get("/summary", dependencies=[Depends(require_api_key)])
 async def get_resources_summary():
-    """عرض إحصائيات الموارد المخزنة محلياً في SQLite وحالة الاتصال بالمنصة."""
+    """عرض إحصائيات الموارد المخزنة محلياً في SQLite وحالة الاتصال بالمنصة والذاكرة RAM."""
+    from app.services.platform.fast_resource_cache import fast_resource_cache
     summary = platform_sync_service.db.get_summary()
     return {
         "success": True,
         "platform_base_url": platform_sync_service.get_platform_base_url(),
         "detected_server_url": platform_sync_service.detect_server_url(),
         "summary": summary,
+        "ram_cache_stats": fast_resource_cache.stats(),
     }
 
 
