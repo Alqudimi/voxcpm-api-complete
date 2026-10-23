@@ -237,3 +237,4 @@ class NanoVLLMEngine:
     name = "nanovllm"
 
     def __init__(self, model_path: str):
+        pass
