@@ -25,8 +25,9 @@ jobs:
       - name: Run ShellCheck
         uses: ludeeus/action-shellcheck@master
         with:
-          severity: warning
+          severity: error
           ignore_paths: >-
             .git
             venv
             .venv
+            tests

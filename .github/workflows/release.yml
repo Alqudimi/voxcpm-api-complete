@@ -22,9 +22,6 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -35,11 +32,16 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Downcase Repository Name for Docker Tag
+        id: repo-name
+        run: |
+          echo "IMAGE_NAME=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
       - name: Determine Docker Metadata & Tags
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository }}
+          images: ${{ env.IMAGE_NAME }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -64,7 +66,8 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           TAG_NAME="${{ github.ref_name }}"
-          PRIMARY_TAG="${{ fromJSON(steps.meta.outputs.json).tags[0] }}"
+          LOWER_REPO="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
+          PRIMARY_TAG="ghcr.io/${LOWER_REPO}:${TAG_NAME}"
           echo "Pulling/Saving built image: $PRIMARY_TAG"
           docker pull "$PRIMARY_TAG"
           docker save "$PRIMARY_TAG" | gzip > "voxcpm-docker-image-${TAG_NAME}.tar.gz"
