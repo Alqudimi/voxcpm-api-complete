@@ -1,0 +1,110 @@
+name: Docker Image Build & Release Publisher
+
+on:
+  push:
+    branches: [ "main", "master" ]
+    tags: [ "v*.*.*" ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-release-docker:
+    name: Build Docker, Publish to Registry & Release Assets
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry (GHCR)
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Determine Docker Metadata & Tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' }}
+
+      - name: Build and Push Docker Image to GHCR
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # =========================================================================
+      # في حالة الـ Tag (Release)، تصدير صورة Docker محزومة كملف tar.gz للـ Release
+      # =========================================================================
+      - name: Export and Compress Docker Image Archive for Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG_NAME="${{ github.ref_name }}"
+          PRIMARY_TAG="${{ fromJSON(steps.meta.outputs.json).tags[0] }}"
+          echo "Pulling/Saving built image: $PRIMARY_TAG"
+          docker pull "$PRIMARY_TAG"
+          docker save "$PRIMARY_TAG" | gzip > "voxcpm-docker-image-${TAG_NAME}.tar.gz"
+          echo "Docker image archive created: voxcpm-docker-image-${TAG_NAME}.tar.gz"
+
+      - name: Create Source Packages for Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tar --exclude='.git' --exclude='.github' --exclude='__pycache__' -czf voxcpm-api-${{ github.ref_name }}.tar.gz .
+          zip -r voxcpm-api-${{ github.ref_name }}.zip . -x "*.git*" "*.github*" "*__pycache__*"
+
+      - name: Publish or Update GitHub Release with Docker Archive
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Release ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+          body: |
+            ## 🚀 VoxCPM API Release ${{ github.ref_name }}
+            
+            ### 🐳 Docker Container:
+            - **Registry Image (GHCR)**:
+              ```bash
+              docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+              ```
+            - **Latest Image**:
+              ```bash
+              docker pull ghcr.io/${{ github.repository }}:latest
+              ```
+            - **Offline Image Tarball**: You can download `voxcpm-docker-image-${{ github.ref_name }}.tar.gz` attached below and load it offline using:
+              ```bash
+              docker load < voxcpm-docker-image-${{ github.ref_name }}.tar.gz
+              ```
+          files: |
+            voxcpm-docker-image-${{ github.ref_name }}.tar.gz
+            voxcpm-api-${{ github.ref_name }}.tar.gz
+            voxcpm-api-${{ github.ref_name }}.zip
+            install-and-start.sh
+            install-colab.sh
+            Dockerfile
+            docker-compose.yml

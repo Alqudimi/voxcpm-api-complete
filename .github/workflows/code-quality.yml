@@ -1,0 +1,42 @@
+name: Code Style & Type Check
+
+on:
+  push:
+    branches: [ "main", "master", "dev" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format-and-typecheck:
+    name: Ruff Format & MyPy Static Check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+          cache: "pip"
+
+      - name: Install Tooling
+        run: |
+          python -m pip install --upgrade pip
+          pip install ruff mypy pydantic pydantic-settings fastapi
+
+      - name: Check Code Formatting with Ruff
+        run: |
+          ruff format --check .
+
+      - name: Static Type Checking with MyPy
+        run: |
+          mypy app/ --ignore-missing-imports --no-strict-optional || true

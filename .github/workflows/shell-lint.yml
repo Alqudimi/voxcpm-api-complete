@@ -1,0 +1,32 @@
+name: Shell Scripts Lint & Validation
+
+on:
+  push:
+    paths:
+      - '**.sh'
+      - '.github/workflows/shell-lint.yml'
+  pull_request:
+    paths:
+      - '**.sh'
+      - '.github/workflows/shell-lint.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  shellcheck:
+    name: Run ShellCheck on Installation Scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Run ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          severity: warning
+          ignore_paths: >-
+            .git
+            venv
+            .venv
