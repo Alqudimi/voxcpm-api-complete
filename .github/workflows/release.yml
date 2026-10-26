@@ -71,8 +71,12 @@ jobs:
           PRIMARY_TAG="ghcr.io/${LOWER_REPO}:${RELEASE_TAG}"
           echo "Pulling/Saving built image: $PRIMARY_TAG"
           docker pull "$PRIMARY_TAG"
-          docker save "$PRIMARY_TAG" | gzip > "voxcpm-docker-image-${RELEASE_TAG}.tar.gz"
-          echo "Docker image archive created: voxcpm-docker-image-${RELEASE_TAG}.tar.gz"
+          ARCHIVE="voxcpm-docker-image-${RELEASE_TAG}.tar.gz"
+          docker save "$PRIMARY_TAG" | gzip > "$ARCHIVE"
+          # GitHub Release assets must be smaller than 2 GiB; split into 1.9 GB parts.
+          split -b 1900M -d -a 3 "$ARCHIVE" "${ARCHIVE}.part-"
+          rm "$ARCHIVE"
+          ls -lh "${ARCHIVE}.part-"*
 
       - name: Create Source Packages for Release
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
@@ -105,12 +109,13 @@ jobs:
               ```bash
               docker pull ghcr.io/${{ github.repository }}:latest
               ```
-            - **Offline Image Tarball**: You can download `voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz` attached below and load it offline using:
+            - **Offline Image Tarball**: Download all `voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz.part-*` files, then reassemble and load them offline using:
               ```bash
+              cat voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz.part-* > voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz
               docker load < voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz
               ```
           files: |
-            voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz
+            voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz.part-*
             voxcpm-api-${{ env.RELEASE_TAG }}.tar.gz
             voxcpm-api-${{ env.RELEASE_TAG }}.zip
             install-and-start.sh
