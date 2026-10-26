@@ -319,19 +319,30 @@ class PlatformSyncService:
         for path in candidate_paths:
             endpoint_url = f"{base_url}{path}"
             logger.info("محاولة جلب الموارد من: %s", endpoint_url)
+            headers = {
+                "Accept": "application/json",
+                "User-Agent": f"VoxCPM-API/{settings.APP_VERSION}",
+            }
+            if settings.API_KEY:
+                headers["X-API-Key"] = settings.API_KEY
+                headers["Authorization"] = f"Bearer {settings.API_KEY}"
+
             req = urllib.request.Request(
                 endpoint_url,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent": f"VoxCPM-API/{settings.APP_VERSION}",
-                },
+                headers=headers,
             )
             try:
                 with urllib.request.urlopen(req, timeout=30.0) as resp:
                     resp_json = json.loads(resp.read().decode("utf-8"))
                     if resp_json.get("success") or "data" in resp_json:
                         data = resp_json.get("data", resp_json)
+                        logger.info("تم جلب الموارد بنجاح من: %s", endpoint_url)
                         break
+            except urllib.error.HTTPError as he:
+                err_body = he.read().decode("utf-8", errors="ignore")
+                last_error = f"HTTP Error {he.code}: {err_body[:300] if err_body else he.reason}"
+                logger.warning("فشل المسار %s (%s): %s", path, he.code, err_body[:200])
+                continue
             except Exception as e:
                 last_error = str(e)
                 logger.debug("فشل المسار %s: %s", path, e)
