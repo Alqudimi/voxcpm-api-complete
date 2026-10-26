@@ -63,20 +63,8 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Export a Docker image archive for both rolling branch releases and versioned releases.
-      - name: Export and Compress Docker Image Archive for Release
-        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
-        run: |
-          LOWER_REPO="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          PRIMARY_TAG="ghcr.io/${LOWER_REPO}:${RELEASE_TAG}"
-          echo "Pulling/Saving built image: $PRIMARY_TAG"
-          docker pull "$PRIMARY_TAG"
-          ARCHIVE="voxcpm-docker-image-${RELEASE_TAG}.tar.gz"
-          docker save "$PRIMARY_TAG" | gzip > "$ARCHIVE"
-          # GitHub Release assets must be smaller than 2 GiB; split into 1.9 GB parts.
-          split -b 1900M -d -a 3 "$ARCHIVE" "${ARCHIVE}.part-"
-          rm "$ARCHIVE"
-          ls -lh "${ARCHIVE}.part-"*
+      # The Docker image is published to GHCR above. GitHub Release assets are kept
+      # lightweight so every push can finish without compressing a multi-GB image.
 
       - name: Create Source Packages for Release
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
@@ -87,7 +75,7 @@ jobs:
           mv "${ARCHIVE_DIR}/voxcpm-api-${RELEASE_TAG}.tar.gz" .
           mv "${ARCHIVE_DIR}/voxcpm-api-${RELEASE_TAG}.zip" .
 
-      - name: Publish or Update GitHub Release with Docker Archive
+      - name: Publish or Update GitHub Release
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
         uses: softprops/action-gh-release@v2
         with:
@@ -109,13 +97,11 @@ jobs:
               ```bash
               docker pull ghcr.io/${{ github.repository }}:latest
               ```
-            - **Offline Image Tarball**: Download all `voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz.part-*` files, then reassemble and load them offline using:
-              ```bash
-              cat voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz.part-* > voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz
-              docker load < voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz
-              ```
+            The Docker image is published to GHCR by this workflow. Pull it with:
+            ```bash
+            docker pull ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}
+            ```
           files: |
-            voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz.part-*
             voxcpm-api-${{ env.RELEASE_TAG }}.tar.gz
             voxcpm-api-${{ env.RELEASE_TAG }}.zip
             install-and-start.sh
