@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     TEMP_DIR: str = "storage/temp"
 
     # ─── إعدادات منصة استنساخ الصوت ومزامنة الموارد الخارجية ───
-    PLATFORM_BASE_URL: str = os.getenv("PLATFORM_BASE_URL", "https://voicecloning.novacortexnc.com")  # رابط المنصة الخارجية الرئيسي
+    PLATFORM_BASE_URL: str = os.getenv("PLATFORM_BASE_URL", "https://voicecloning.novacortexnc.com/"),                # رابط المنصة الخارجية الرئيسي (مثال: http://localhost:8000)
     SERVER_PUBLIC_URL: str = ""                # رابط الخادم الحالي لإرساله للمنصة (يحسب تلقائياً إن ترك فارغاً)
     PLATFORM_SYNC_ON_STARTUP: bool = True      # تحميل وتخزين أصوات العينات والضوضاء عند الإقلاع
     PLATFORM_REGISTER_ON_STARTUP: bool = True  # إرسال الدومين ومفتاح API للمنصة عند الإقلاع
