@@ -10,6 +10,10 @@ permissions:
   contents: write
   packages: write
 
+env:
+  # Branch pushes update one rolling release; version tags create immutable releases.
+  RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'latest' }}
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -59,54 +63,53 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # =========================================================================
-      # في حالة الـ Tag (Release)، تصدير صورة Docker محزومة كملف tar.gz للـ Release
-      # =========================================================================
+      # Export a Docker image archive for both rolling branch releases and versioned releases.
       - name: Export and Compress Docker Image Archive for Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
         run: |
-          TAG_NAME="${{ github.ref_name }}"
           LOWER_REPO="$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')"
-          PRIMARY_TAG="ghcr.io/${LOWER_REPO}:${TAG_NAME}"
+          PRIMARY_TAG="ghcr.io/${LOWER_REPO}:${RELEASE_TAG}"
           echo "Pulling/Saving built image: $PRIMARY_TAG"
           docker pull "$PRIMARY_TAG"
-          docker save "$PRIMARY_TAG" | gzip > "voxcpm-docker-image-${TAG_NAME}.tar.gz"
-          echo "Docker image archive created: voxcpm-docker-image-${TAG_NAME}.tar.gz"
+          docker save "$PRIMARY_TAG" | gzip > "voxcpm-docker-image-${RELEASE_TAG}.tar.gz"
+          echo "Docker image archive created: voxcpm-docker-image-${RELEASE_TAG}.tar.gz"
 
       - name: Create Source Packages for Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
         run: |
-          tar --exclude='.git' --exclude='.github' --exclude='__pycache__' -czf voxcpm-api-${{ github.ref_name }}.tar.gz .
-          zip -r voxcpm-api-${{ github.ref_name }}.zip . -x "*.git*" "*.github*" "*__pycache__*"
+          tar --exclude='.git' --exclude='.github' --exclude='__pycache__' -czf "voxcpm-api-${RELEASE_TAG}.tar.gz" .
+          zip -r "voxcpm-api-${RELEASE_TAG}.zip" . -x "*.git*" "*.github*" "*__pycache__*"
 
       - name: Publish or Update GitHub Release with Docker Archive
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
         uses: softprops/action-gh-release@v2
         with:
-          name: Release ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG == 'latest' && 'Latest build' || format('Release {0}', env.RELEASE_TAG) }}
+          target_commitish: ${{ github.sha }}
           draft: false
           prerelease: false
           generate_release_notes: true
+          overwrite_files: true
           body: |
-            ## 🚀 VoxCPM API Release ${{ github.ref_name }}
-            
+            ## 🚀 VoxCPM API Release ${{ env.RELEASE_TAG }}
             ### 🐳 Docker Container:
             - **Registry Image (GHCR)**:
               ```bash
-              docker pull ghcr.io/${{ github.repository }}:${{ github.ref_name }}
+              docker pull ghcr.io/${{ github.repository }}:${{ env.RELEASE_TAG }}
               ```
             - **Latest Image**:
               ```bash
               docker pull ghcr.io/${{ github.repository }}:latest
               ```
-            - **Offline Image Tarball**: You can download `voxcpm-docker-image-${{ github.ref_name }}.tar.gz` attached below and load it offline using:
+            - **Offline Image Tarball**: You can download `voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz` attached below and load it offline using:
               ```bash
-              docker load < voxcpm-docker-image-${{ github.ref_name }}.tar.gz
+              docker load < voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz
               ```
           files: |
-            voxcpm-docker-image-${{ github.ref_name }}.tar.gz
-            voxcpm-api-${{ github.ref_name }}.tar.gz
-            voxcpm-api-${{ github.ref_name }}.zip
+            voxcpm-docker-image-${{ env.RELEASE_TAG }}.tar.gz
+            voxcpm-api-${{ env.RELEASE_TAG }}.tar.gz
+            voxcpm-api-${{ env.RELEASE_TAG }}.zip
             install-and-start.sh
             install-colab.sh
             Dockerfile
