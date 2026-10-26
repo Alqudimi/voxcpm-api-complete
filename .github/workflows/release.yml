@@ -77,8 +77,11 @@ jobs:
       - name: Create Source Packages for Release
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
         run: |
-          tar --exclude='.git' --exclude='.github' --exclude='__pycache__' -czf "voxcpm-api-${RELEASE_TAG}.tar.gz" .
-          zip -r "voxcpm-api-${RELEASE_TAG}.zip" . -x "*.git*" "*.github*" "*__pycache__*"
+          ARCHIVE_DIR="$(mktemp -d)"
+          tar --exclude='.git' --exclude='.github' --exclude='__pycache__' -czf "${ARCHIVE_DIR}/voxcpm-api-${RELEASE_TAG}.tar.gz" .
+          zip -q -r "${ARCHIVE_DIR}/voxcpm-api-${RELEASE_TAG}.zip" . -x "*.git*" "*.github*" "*__pycache__*" "voxcpm-api-${RELEASE_TAG}.zip"
+          mv "${ARCHIVE_DIR}/voxcpm-api-${RELEASE_TAG}.tar.gz" .
+          mv "${ARCHIVE_DIR}/voxcpm-api-${RELEASE_TAG}.zip" .
 
       - name: Publish or Update GitHub Release with Docker Archive
         if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master' || startsWith(github.ref, 'refs/tags/v'))
