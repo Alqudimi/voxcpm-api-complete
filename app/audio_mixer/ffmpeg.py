@@ -145,7 +145,7 @@ class FFmpeg:
         crossfade: float = 0.5,
         variation_seed: int | None = None,
         output_format: str = "wav",
-        noise_extension_seconds: float = 2.0,
+        noise_extension_seconds: float = 1.0,
         timeout=120,
         source_metadata=None,
         noise_metadata=None,

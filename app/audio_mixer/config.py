@@ -16,7 +16,7 @@ class Settings:
     max_audio_duration: float = 1800.0
     max_concurrent_jobs: int = 2
     max_queue_size: int = 8
-    min_noise_margin_seconds: float = 2.0
+    min_noise_margin_seconds: float = 1.0
     dataset_path: Path = Path("./data/mixkit_sfx_scraped_raw.json")
     auto_import_mixkit: bool = False
     import_workers: int = 8
@@ -46,6 +46,9 @@ class Settings:
             ),
             max_concurrent_jobs=int(os.getenv("AUDIO_MIXER_MAX_CONCURRENT_JOBS", "2")),
             max_queue_size=int(os.getenv("AUDIO_MIXER_MAX_QUEUE_SIZE", "8")),
+            min_noise_margin_seconds=float(
+                os.getenv("AUDIO_MIXER_NOISE_EXTENSION_SECONDS", "1")
+            ),
             dataset_path=Path(
                 os.getenv(
                     "AUDIO_MIXER_DATASET_PATH", "./data/mixkit_sfx_scraped_raw.json"

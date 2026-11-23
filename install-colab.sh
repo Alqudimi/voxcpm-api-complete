@@ -422,65 +422,59 @@ trap - EXIT
 cloudflared --version
 
 # ============================================================
-# 13. Start API and Cloudflare Tunnel
+# 13. Start API and Cloudflare Tunnel independently
 # ============================================================
 
 PORT="${PORT:-8000}"
 HOST="${HOST:-0.0.0.0}"
 
-export PORT HOST
-export HF_HOME HUGGINGFACE_HUB_CACHE XDG_CACHE_HOME
+export PORT HOST HF_HOME HUGGINGFACE_HUB_CACHE XDG_CACHE_HOME
 
 cd "$PROJECT"
 
+API_LOG="/content/voxcpm-api.log"
+TUNNEL_LOG="/content/cloudflared.log"
+
+API_PID_FILE="/content/voxcpm-api.pid"
+TUNNEL_PID_FILE="/content/cloudflared.pid"
+
+# ------------------------------------------------------------
+# Start FastAPI
+# ------------------------------------------------------------
+
 echo ""
-echo "============================================================"
-echo "Starting VoxCPM API"
-echo "============================================================"
-echo "Project: $PROJECT"
-echo "Host:    $HOST"
-echo "Port:    $PORT"
+echo "Starting FastAPI in background..."
 
-# Launch API in the background so cloudflared can run alongside it.
-"$PYTHON_BIN" -m uvicorn app.main:app \
-    --host "$HOST" \
-    --port "$PORT" \
-    --workers 1 \
-    > /content/voxcpm-api.log 2>&1 &
+if [[ -f "$API_PID_FILE" ]] && kill -0 "$(cat "$API_PID_FILE")" 2>/dev/null; then
+    API_PID="$(cat "$API_PID_FILE")"
+    echo "Existing API process: $API_PID"
+else
+    nohup setsid "$PYTHON_BIN" -m uvicorn app.main:app \
+        --host "$HOST" \
+        --port "$PORT" \
+        --workers 1 \
+        </dev/null >> "$API_LOG" 2>&1 &
 
-API_PID=$!
+    API_PID=$!
+    echo "$API_PID" > "$API_PID_FILE"
+fi
 
-cleanup() {
-    echo ""
-    echo "Stopping VoxCPM API and Cloudflare Tunnel..."
+# ------------------------------------------------------------
+# Wait for FastAPI
+# ------------------------------------------------------------
 
-    if [[ -n "${TUNNEL_PID:-}" ]]; then
-        kill "$TUNNEL_PID" 2>/dev/null || true
-    fi
-
-    if [[ -n "${API_PID:-}" ]]; then
-        kill "$API_PID" 2>/dev/null || true
-    fi
-
-    wait 2>/dev/null || true
-}
-
-trap cleanup EXIT INT TERM
-
-# Wait for FastAPI to start before opening the tunnel.
-echo "Waiting for FastAPI..."
+echo "Waiting for API..."
 
 API_READY=0
 
 for _ in $(seq 1 120); do
     if ! kill -0 "$API_PID" 2>/dev/null; then
-        echo "ERROR: FastAPI stopped during startup." >&2
-        cat /content/voxcpm-api.log >&2
+        echo "ERROR: API stopped."
+        tail -n 100 "$API_LOG"
         exit 1
     fi
 
-    if curl -fsS "http://127.0.0.1:${PORT}/openapi.json" \
-        -o /dev/null 2>/dev/null; then
+    if curl -fsS "http://127.0.0.1:${PORT}/openapi.json" -o /dev/null 2>/dev/null; then
         API_READY=1
         break
     fi
@@ -489,41 +483,51 @@ for _ in $(seq 1 120); do
 done
 
 if [[ "$API_READY" != "1" ]]; then
-    echo "ERROR: FastAPI did not become ready within 240 seconds." >&2
-    cat /content/voxcpm-api.log >&2
+    echo "ERROR: API startup timeout."
+    tail -n 100 "$API_LOG"
     exit 1
 fi
 
-echo "FastAPI is responding locally."
+echo "FastAPI: READY"
 
-# Quick Tunnel outputs its temporary public URL to stderr.
-TUNNEL_LOG="/content/cloudflared.log"
-: > "$TUNNEL_LOG"
-
-cloudflared tunnel \
-    --url "http://127.0.0.1:${PORT}" \
-    --no-autoupdate \
-    > /content/cloudflared.stdout.log \
-    2> "$TUNNEL_LOG" &
-
-TUNNEL_PID=$!
+# ------------------------------------------------------------
+# Start Cloudflare Tunnel
+# ------------------------------------------------------------
 
 echo ""
+echo "Starting Cloudflare Tunnel..."
+
+if [[ -f "$TUNNEL_PID_FILE" ]] && kill -0 "$(cat "$TUNNEL_PID_FILE")" 2>/dev/null; then
+    TUNNEL_PID="$(cat "$TUNNEL_PID_FILE")"
+    echo "Existing Tunnel process: $TUNNEL_PID"
+else
+    : > "$TUNNEL_LOG"
+
+    nohup setsid cloudflared tunnel \
+        --url "http://127.0.0.1:${PORT}" \
+        --no-autoupdate \
+        </dev/null >> "$TUNNEL_LOG" 2>&1 &
+
+    TUNNEL_PID=$!
+    echo "$TUNNEL_PID" > "$TUNNEL_PID_FILE"
+fi
+
+# ------------------------------------------------------------
+# Retrieve public URL
+# ------------------------------------------------------------
+
 echo "Waiting for Cloudflare URL..."
 
 PUBLIC_URL=""
 
-for _ in $(seq 1 60); do
+for _ in $(seq 1 90); do
     if ! kill -0 "$TUNNEL_PID" 2>/dev/null; then
-        echo "ERROR: Cloudflare Tunnel stopped unexpectedly." >&2
-        cat "$TUNNEL_LOG" >&2
+        echo "ERROR: Tunnel stopped."
+        tail -n 100 "$TUNNEL_LOG"
         exit 1
     fi
 
-    PUBLIC_URL="$(
-        grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" \
-            | head -n 1 || true
-    )"
+    PUBLIC_URL="$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$TUNNEL_LOG" | tail -n 1 || true)"
 
     if [[ -n "$PUBLIC_URL" ]]; then
         break
@@ -533,41 +537,69 @@ for _ in $(seq 1 60); do
 done
 
 if [[ -z "$PUBLIC_URL" ]]; then
-    echo "ERROR: Could not retrieve a public Cloudflare URL." >&2
-    cat "$TUNNEL_LOG" >&2
+    echo "ERROR: Could not retrieve Cloudflare URL."
+    tail -n 100 "$TUNNEL_LOG"
     exit 1
 fi
 
-# Save the public URL to indicator file so FastAPI startup or watcher detects it immediately
+# ------------------------------------------------------------
+# Save URL
+# ------------------------------------------------------------
+
 echo "$PUBLIC_URL" > /content/tunnel_url.txt
 echo "$PUBLIC_URL" > /tmp/tunnel_url.txt
 
-# Proactively notify FastAPI register endpoint with the public Cloudflare URL
-curl -fsS -X POST "http://127.0.0.1:${PORT}/api/v1/resources/register-server?server_url=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$PUBLIC_URL'))")" \
-    -H "accept: application/json" >/dev/null 2>&1 || true
+# ------------------------------------------------------------
+# Register server
+# ------------------------------------------------------------
+
+"$PYTHON_BIN" - "$PUBLIC_URL" "$PORT" <<'PY'
+import sys
+import urllib.parse
+import urllib.request
+
+public_url, port = sys.argv[1:3]
+
+url = (
+    f"http://127.0.0.1:{port}"
+    "/api/v1/resources/register-server?"
+    + urllib.parse.urlencode({"server_url": public_url})
+)
+
+try:
+    request = urllib.request.Request(
+        url,
+        headers={"accept": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=15) as response:
+        print("Registration:", response.status)
+except Exception as exc:
+    print("Registration warning:", exc)
+PY
+
+# ------------------------------------------------------------
+# Final status
+# ------------------------------------------------------------
 
 echo ""
 echo "============================================================"
-echo "VOXCPM API IS RUNNING"
+echo "VOXCPM API IS RUNNING IN BACKGROUND"
 echo "============================================================"
+
 echo "Public API: $PUBLIC_URL"
-echo "Swagger UI: $PUBLIC_URL/docs"
+echo "Swagger:    $PUBLIC_URL/docs"
 echo "OpenAPI:    $PUBLIC_URL/openapi.json"
+
 echo ""
-echo "Local API:  http://127.0.0.1:$PORT"
-echo "API logs:   /content/voxcpm-api.log"
-echo "Tunnel log: /content/cloudflared.log"
+echo "API PID:    $API_PID"
+echo "Tunnel PID: $TUNNEL_PID"
+
 echo ""
-echo "IMPORTANT:"
-echo "1. Keep this Colab cell running."
-echo "2. The URL is temporary and changes when the tunnel restarts."
-echo "3. Colab runtime files disappear when the runtime is deleted."
-echo "4. Protect your API key; do not publish it."
-echo "5. Use the API key required by your project's authentication."
+echo "API log:    $API_LOG"
+echo "Tunnel log: $TUNNEL_LOG"
+
+echo ""
+echo "Both services are running independently."
+echo "The installation script can now exit safely."
 echo "============================================================"
-
-# Keep this cell active and forward logs until interrupted.
-tail -n 0 -F /content/voxcpm-api.log "$TUNNEL_LOG" &
-TAIL_PID=$!
-
-wait "$API_PID"
